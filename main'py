@@ -49,13 +49,38 @@ ADMIN_ID         = 6982051442
 ADMIN_USERNAME   = "@leaderOdg"
 COMMISSION_PCT   = 20
 
-# ─── API Binance (trading automatique) ─────────────────
+# ─── API Binance Futures (trading automatique crypto) ──
 # Sur Binance : Compte → Gestion API → Créer API
-# Active uniquement : "Enable Spot & Margin Trading"
+# Active : "Enable Futures" UNIQUEMENT — pas de retrait !
 BINANCE_API_KEY       = "REMPLACE_PAR_TA_CLE_API_BINANCE"
 BINANCE_API_SECRET    = "REMPLACE_PAR_TON_SECRET_API_BINANCE"
-BINANCE_TRADING_ACTIF = False   # Mets True pour activer les trades réels
-MISE_PAR_TRADE_USDT   = 10      # Montant USDT par trade (ex: 10$)
+BINANCE_TRADING_ACTIF = False    # ⚠️ Mets True pour activer les trades réels
+
+# ─── Paramètres stratégie ───────────────────────────────
+MISE_PAR_TRADE_USDT   = 5        # ⚠️ Montant USDT par trade — TU CHOISIS (ex: 5$)
+LEVIER_DEFAUT         = 20       # Levier x20 sur Futures
+# ─── Gestion du risque dynamique ───────────────────────
+# SL = placé sous/sur la zone Order Block (pas un % fixe)
+# Buffer = marge de sécurité sous le SL pour éviter les faux SL
+SL_BUFFER_PCT         = 0.2     # Buffer sous le bas de l'OB (ex: 0.2%)
+RISQUE_PAR_TRADE_PCT  = 1.0     # % du capital risqué par trade (ex: 1%)
+# ⚠️ La mise est recalculée automatiquement selon le risque réel
+# Ex: capital 100$, risque 1% = max 1$ de perte → mise adaptée au SL OB
+
+TP1_PCT               = 2.0     # TP1 à +2.0% — ferme 40% de la position
+TP2_PCT               = 4.0     # TP2 à +4.0% — ferme 35% de la position
+TP3_PCT               = 7.0     # TP3 à +7.0% — ferme 25% restants
+
+# ─── Trailing Stop Loss ─────────────────────────────────
+TRAILING_ACTIF        = True    # Active le suivi automatique du SL
+TRAILING_CALLBACK_PCT = 1.0     # Trailing : recule de 1% dès que le prix monte
+
+MAX_TRADES_OUVERTS    = 2       # Jamais plus de 2 trades ouverts simultanément
+CRYPTO_AUTO = [                 # Paires crypto tradées automatiquement
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+]
 
 # ─── Alertes Email ─────────────────────────────────────
 # Gmail → Mon compte → Sécurité → Mots de passe des applications
@@ -108,61 +133,283 @@ def envoyer_email(sujet, corps):
 
 
 # ═══════════════════════════════════════════════════════
-# TRADING BINANCE AUTOMATIQUE
+# TRADING BINANCE FUTURES — STRATÉGIE ORDER BLOCK AUTO
+# Capital < 100$ | Levier x20 | Mise manuelle
+# Crypto uniquement : BTC, ETH, SOL
 # ═══════════════════════════════════════════════════════
 
-def executer_trade_binance(signal):
+def get_nb_trades_ouverts(client):
+    """Compte le nombre de positions Futures actuellement ouvertes."""
+    try:
+        compte = client.futures_account()
+        return len([p for p in compte["positions"] if float(p["positionAmt"]) != 0])
+    except Exception:
+        return 0
+
+def get_precision_symbol(client, symbol):
+    """Récupère la précision de quantité pour un symbole Futures."""
+    try:
+        info = client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == symbol:
+                for f in s["filters"]:
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        if step >= 1:
+                            return 0
+                        return len(str(step).rstrip("0").split(".")[-1])
+        return 3
+    except Exception:
+        return 3
+
+async def executer_trade_binance(signal, bot=None):
     """
-    Exécute un ordre MARKET sur Binance via l'API.
-    Nécessite : BINANCE_TRADING_ACTIF = True + clés API valides.
+    Stratégie Order Block sur Futures Binance.
+    - Crypto uniquement (BTC, ETH, SOL)
+    - Levier x20
+    - Mise choisie manuellement (MISE_PAR_TRADE_USDT)
+    - SL automatique à -1.5%
+    - TP1 à +2% (40%), TP2 à +4% (35%), TP3 à +7% (25%)
+    - Max 2 trades ouverts simultanément
     """
     if not BINANCE_TRADING_ACTIF:
-        print("[BINANCE] Trading désactivé (BINANCE_TRADING_ACTIF = False)")
+        print("[FUTURES] Trading désactivé — BINANCE_TRADING_ACTIF = False")
         return None
+
+    # Vérifier que c'est une paire crypto autorisée
+    symbol_raw = signal["paire"].replace("/", "").replace(" (Or)", "").replace(" ", "")
+    if not symbol_raw.endswith("USDT"):
+        symbol_raw = symbol_raw + "USDT"
+    symbol = symbol_raw.upper()
+
+    if symbol not in CRYPTO_AUTO:
+        print("[FUTURES] " + symbol + " non autorisé pour le trading auto — ignoré")
+        return None
+
     try:
         from binance.client import Client
         from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-        # Calcul de la quantité à acheter
-        symbol   = signal["paire"].replace("/", "").replace(" (Or)", "")
-        ticker   = client.get_symbol_ticker(symbol=symbol)
-        prix     = float(ticker["price"])
-        quantite = round(MISE_PAR_TRADE_USDT / prix, 4)
+        # ── Vérification : max trades ouverts ──
+        nb_ouverts = get_nb_trades_ouverts(client)
+        if nb_ouverts >= MAX_TRADES_OUVERTS:
+            msg_skip = (
+                "⚠️ TRADE BLOQUÉ — MAX " + str(MAX_TRADES_OUVERTS) + " TRADES ATTEINT\n"
+                "Signal : " + signal["paire"] + " " + signal["direction"] + "\n"
+                "Ferme un trade existant avant d'en ouvrir un nouveau."
+            )
+            print("[FUTURES] " + msg_skip)
+            if bot:
+                await bot.send_message(chat_id=ADMIN_ID, text=msg_skip)
+            return None
 
-        side = SIDE_BUY if signal["direction"] == "LONG" else SIDE_SELL
+        # ── Prix actuel ──
+        ticker      = client.futures_symbol_ticker(symbol=symbol)
+        prix_entree = float(ticker["price"])
 
-        ordre = client.order_market(
+        # ── Régler le levier x20 ──
+        client.futures_change_leverage(symbol=symbol, leverage=LEVIER_DEFAUT)
+
+        # ── Calcul quantité ──
+        precision = get_precision_symbol(client, symbol)
+        exposition = MISE_PAR_TRADE_USDT * LEVIER_DEFAUT
+        quantite   = round(exposition / prix_entree, precision)
+
+        # ══════════════════════════════════════════════════
+        # SL BASÉ SUR L'ORDER BLOCK — pas un % fixe
+        # Le SL se place sous/sur la zone OB réelle
+        # ══════════════════════════════════════════════════
+        is_long      = signal["direction"] == "LONG"
+        ob_bas        = float(signal["zone_basse"])
+        ob_haut       = float(signal["zone_haute"])
+        spread_ob     = ob_haut - ob_bas
+
+        if is_long:
+            # SL = sous le bas de l'OB avec un buffer de sécurité
+            sl = round(ob_bas * (1 - SL_BUFFER_PCT / 100), 2)
+        else:
+            # SL = au-dessus du haut de l'OB avec un buffer
+            sl = round(ob_haut * (1 + SL_BUFFER_PCT / 100), 2)
+
+        # ── Distance SL réelle en % ──
+        dist_sl_pct = abs(prix_entree - sl) / prix_entree * 100
+        dist_sl_pct = max(dist_sl_pct, 0.3)   # minimum 0.3% pour éviter SL trop serré
+
+        # ══════════════════════════════════════════════════
+        # RECALCUL DE LA MISE selon le risque réel
+        # Risque = RISQUE_PAR_TRADE_PCT % du capital
+        # La mise s'adapte à la distance SL réelle
+        # ══════════════════════════════════════════════════
+        try:
+            solde_info    = client.futures_account()
+            capital_dispo = float(solde_info["availableBalance"])
+        except Exception:
+            capital_dispo = MISE_PAR_TRADE_USDT * 3   # fallback si erreur API
+
+        risque_max_usdt = capital_dispo * (RISQUE_PAR_TRADE_PCT / 100)
+        # mise = risque_max / (dist_SL_pct * levier / 100)
+        mise_calculee   = round(risque_max_usdt / (dist_sl_pct / 100), 2)
+        # Plafonner à MISE_PAR_TRADE_USDT max défini manuellement
+        mise_finale     = min(mise_calculee, MISE_PAR_TRADE_USDT)
+        mise_finale     = max(mise_finale, 1.0)   # minimum 1 USDT
+
+        exposition      = round(mise_finale * LEVIER_DEFAUT, 2)
+        quantite        = round(exposition / prix_entree, precision)
+
+        # ── TP basés sur le spread OB et la distance SL réelle ──
+        rr_min = 2.0   # ratio R/R minimum imposé
+        if is_long:
+            tp1 = round(prix_entree + dist_sl_pct / 100 * prix_entree * rr_min, 2)
+            tp2 = round(prix_entree * (1 + TP2_PCT / 100), 2)
+            tp3 = round(prix_entree * (1 + TP3_PCT / 100), 2)
+        else:
+            tp1 = round(prix_entree - dist_sl_pct / 100 * prix_entree * rr_min, 2)
+            tp2 = round(prix_entree * (1 - TP2_PCT / 100), 2)
+            tp3 = round(prix_entree * (1 - TP3_PCT / 100), 2)
+
+        rr_reel  = round(abs(tp1 - prix_entree) / abs(prix_entree - sl), 2)
+        sl_pct_affiche = round(dist_sl_pct, 2)
+
+        # ── Calcul liquidation approximative ──
+        if is_long:
+            liq = round(prix_entree * (1 - 1 / LEVIER_DEFAUT * 0.9), 2)
+        else:
+            liq = round(prix_entree * (1 + 1 / LEVIER_DEFAUT * 0.9), 2)
+
+        # ── Exécution ordre MARKET ──
+        side = SIDE_BUY if is_long else SIDE_SELL
+        ordre = client.futures_create_order(
             symbol   = symbol,
             side     = side,
+            type     = ORDER_TYPE_MARKET,
             quantity = quantite
         )
 
-        resultat = (
-            "TRADE EXECUTE SUR BINANCE\n"
-            "Paire    : " + symbol + "\n"
-            "Direction: " + signal["direction"] + "\n"
-            "Quantite : " + str(quantite) + "\n"
-            "Prix     : " + str(prix) + " USDT\n"
-            "Mise     : ~" + str(MISE_PAR_TRADE_USDT) + " USDT\n"
-            "Order ID : " + str(ordre.get("orderId", "N/A"))
-        )
-        print("[BINANCE] " + resultat)
+        side_sl = SIDE_SELL if is_long else SIDE_BUY
 
-        # Alerte email
-        envoyer_email(
-            "⚡ AlphaBot — Trade " + signal["direction"] + " " + symbol,
-            resultat
+        # ── Stop Loss au niveau de l'Order Block ──
+        client.futures_create_order(
+            symbol        = symbol,
+            side          = side_sl,
+            type          = "STOP_MARKET",
+            stopPrice     = sl,
+            closePosition = True
         )
+
+        # ── Trailing Stop Loss (suit le prix automatiquement) ──
+        if TRAILING_ACTIF:
+            try:
+                trailing_cb = round(TRAILING_CALLBACK_PCT * 100)   # en bps Binance
+                client.futures_create_order(
+                    symbol            = symbol,
+                    side              = side_sl,
+                    type              = "TRAILING_STOP_MARKET",
+                    callbackRate      = TRAILING_CALLBACK_PCT,
+                    closePosition     = True
+                )
+                print("[TRAILING] Trailing SL posé — callback " + str(TRAILING_CALLBACK_PCT) + "%")
+            except Exception as e_trail:
+                print("[TRAILING] Erreur trailing : " + str(e_trail) + " — SL fixe conservé")
+
+        # ── TP1 (40%) ──
+        try:
+            client.futures_create_order(
+                symbol        = symbol,
+                side          = side_sl,
+                type          = "TAKE_PROFIT_MARKET",
+                stopPrice     = tp1,
+                closePosition = False,
+                quantity      = round(quantite * 0.40, precision)
+            )
+        except Exception as e_tp:
+            print("[TP1] Erreur : " + str(e_tp))
+
+        # ── TP2 (35%) ──
+        try:
+            client.futures_create_order(
+                symbol        = symbol,
+                side          = side_sl,
+                type          = "TAKE_PROFIT_MARKET",
+                stopPrice     = tp2,
+                closePosition = False,
+                quantity      = round(quantite * 0.35, precision)
+            )
+        except Exception as e_tp:
+            print("[TP2] Erreur : " + str(e_tp))
+
+        # ── TP3 (25% restant) ──
+        try:
+            client.futures_create_order(
+                symbol        = symbol,
+                side          = side_sl,
+                type          = "TAKE_PROFIT_MARKET",
+                stopPrice     = tp3,
+                closePosition = True
+            )
+        except Exception as e_tp:
+            print("[TP3] Erreur : " + str(e_tp))
+
+        # ── Message de confirmation ──
+        direction_txt = "🟢 LONG" if is_long else "🔴 SHORT"
+        trailing_txt  = "✅ Actif (" + str(TRAILING_CALLBACK_PCT) + "%)" if TRAILING_ACTIF else "❌ Désactivé"
+        msg_confirm = (
+            "⚡ TRADE EXÉCUTÉ — FUTURES BINANCE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📌 Paire         : " + symbol + "\n"
+            "📊 Direction     : " + direction_txt + "\n"
+            "💲 Prix entrée   : " + str(prix_entree) + " USDT\n"
+            "📦 Quantité      : " + str(quantite) + "\n"
+            "⚡ Levier        : x" + str(LEVIER_DEFAUT) + "\n"
+            "💰 Mise réelle   : " + str(mise_finale) + " USDT\n"
+            "🔥 Exposition    : " + str(exposition) + " USDT\n"
+            "💵 Capital dispo : " + str(round(capital_dispo, 2)) + " USDT\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🧱 Zone OB       : " + str(ob_bas) + " — " + str(ob_haut) + "\n"
+            "🛑 SL (OB level) : " + str(sl) + " (-" + str(sl_pct_affiche) + "%)\n"
+            "📡 Trailing SL   : " + trailing_txt + "\n"
+            "🎯 TP1 (40%)    : " + str(tp1) + "\n"
+            "🎯 TP2 (35%)    : " + str(tp2) + "\n"
+            "🏆 TP3 (25%)    : " + str(tp3) + "\n"
+            "⚖️  Ratio R/R     : 1:" + str(rr_reel) + "\n"
+            "💀 Liquidation   : " + str(liq) + "\n\n"
+            "🔒 Risque max    : " + str(round(risque_max_usdt, 2)) + " USDT (" + str(RISQUE_PAR_TRADE_PCT) + "% capital)\n"
+            "Order ID         : " + str(ordre.get("orderId", "N/A")) + "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        print("[FUTURES] " + msg_confirm.replace("\n", " | "))
+
+        # ── Notification Telegram → admin uniquement ──
+        if bot:
+            keyboard = [[
+                InlineKeyboardButton("🛑 Couper " + symbol, callback_data="close_" + symbol),
+                InlineKeyboardButton("📊 Positions",        callback_data="refresh_pos"),
+            ]]
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=msg_confirm,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        # ── Alerte email ──
+        envoyer_email(
+            "⚡ Trade AUTO " + signal["direction"] + " " + symbol,
+            msg_confirm.replace("\n", "\n")
+        )
+
         return ordre
 
     except ImportError:
-        print("[BINANCE] Installe python-binance : pip install python-binance")
+        print("[FUTURES] Installe python-binance : pip install python-binance")
         return None
     except Exception as e:
-        print("[BINANCE] Erreur trade : " + str(e))
-        envoyer_email("⚠️ AlphaBot — Erreur Trade", "Erreur : " + str(e))
+        err = "[FUTURES] Erreur : " + str(e)
+        print(err)
+        if bot:
+            await bot.send_message(chat_id=ADMIN_ID, text="⚠️ " + err)
+        envoyer_email("⚠️ Erreur Trade Futures", err)
         return None
 
 
@@ -170,10 +417,11 @@ def executer_trade_binance(signal):
 # PAIRES FOREX & CRYPTO A SCANNER
 # ═══════════════════════════════════════════════════════
 
-# Paires Crypto Futures sur Binance
-# BTC = référence marché uniquement (pas prioritaire pour les signaux)
+# Paires Crypto Futures scannées et tradées automatiquement
 PAIRES_CRYPTO = [
     {"symbol": "BTCUSDT",  "nom": "BTC/USDT",  "emoji": "₿"},
+    {"symbol": "ETHUSDT",  "nom": "ETH/USDT",  "emoji": "Ξ"},
+    {"symbol": "SOLUSDT",  "nom": "SOL/USDT",  "emoji": "◎"},
 ]
 
 # ─── Paires PRIORITAIRES — Gold + Forex (signaux principaux du groupe) ──────
@@ -339,6 +587,168 @@ def get_fear_greed():
         return {"value": 50, "label": "Neutral"}
 
 # ═══════════════════════════════════════════════════════
+# MODULE ICT — TR / CRT / EQUILIBRIUM / SWEEP
+# ═══════════════════════════════════════════════════════
+
+def calculer_trading_range(candles, periode=20):
+    """
+    TR — Trading Range institutionnel.
+    Identifie le High et Low des N dernières bougies.
+    Calcule l'Equilibrium (50% du range) et les quartiles.
+    """
+    if len(candles) < periode:
+        return None
+
+    fenetre  = candles[-periode:]
+    tr_high  = max(c["high"] for c in fenetre)
+    tr_low   = min(c["low"]  for c in fenetre)
+    tr_range = tr_high - tr_low
+
+    if tr_range == 0:
+        return None
+
+    equilibrium = round(tr_low + tr_range * 0.5, 5)
+    premium     = round(tr_low + tr_range * 0.75, 5)   # zone de vente (SHORT)
+    discount    = round(tr_low + tr_range * 0.25, 5)   # zone d'achat (LONG)
+
+    return {
+        "high":        tr_high,
+        "low":         tr_low,
+        "range":       tr_range,
+        "equilibrium": equilibrium,
+        "premium":     premium,     # au-dessus = zone SHORT
+        "discount":    discount,    # en-dessous = zone LONG
+    }
+
+
+def detecter_sweep(candles, direction, lookback=5):
+    """
+    SWEEP / Liquidity Grab.
+    Vérifie que le prix a chassé la liquidité (faux breakout)
+    avant de revenir dans le range — confirmation d'entrée ICT.
+
+    LONG  : sweep sous le Low récent puis retour au-dessus
+    SHORT : sweep au-dessus du High récent puis retour en-dessous
+    """
+    if len(candles) < lookback + 2:
+        return False
+
+    recentes  = candles[-(lookback + 2):-2]
+    avant_der = candles[-2]
+    derniere  = candles[-1]
+
+    if direction == "LONG":
+        # Le prix est descendu sous le low de la zone puis est remonté
+        low_zone = min(c["low"] for c in recentes)
+        swept    = avant_der["low"] < low_zone        # a touché sous le low
+        retour   = derniere["close"] > avant_der["low"]  # est remonté au-dessus
+        return swept and retour
+
+    else:  # SHORT
+        high_zone = max(c["high"] for c in recentes)
+        swept     = avant_der["high"] > high_zone
+        retour    = derniere["close"] < avant_der["high"]
+        return swept and retour
+
+
+def detecter_crt(candles):
+    """
+    CRT — Candle Range Theory.
+    La bougie actuelle doit sortir du range de la bougie précédente
+    (breakout du high ou low de la N-1) pour confirmer le momentum.
+
+    Retourne :
+      "BULLISH" — close actuelle > high de la bougie précédente
+      "BEARISH" — close actuelle < low de la bougie précédente
+      None      — pas de CRT
+    """
+    if len(candles) < 3:
+        return None
+
+    prev    = candles[-2]   # bougie N-1
+    current = candles[-1]   # bougie actuelle
+
+    if current["close"] > prev["high"]:
+        return "BULLISH"
+    if current["close"] < prev["low"]:
+        return "BEARISH"
+    return None
+
+
+def verifier_equilibrium(prix_actuel, tr, direction):
+    """
+    Vérifie que le prix est dans la bonne zone du TR pour entrer.
+    LONG  → prix doit être en zone Discount (< Equilibrium)
+    SHORT → prix doit être en zone Premium (> Equilibrium)
+    Tolerance de 5% du range pour les cas limites.
+    """
+    if tr is None:
+        return True   # pas de TR = pas de filtre
+
+    tolerance = tr["range"] * 0.05
+
+    if direction == "LONG":
+        return prix_actuel <= tr["equilibrium"] + tolerance
+    else:
+        return prix_actuel >= tr["equilibrium"] - tolerance
+
+
+def confirmer_ict(candles, signal):
+    """
+    Confirmation ICT complète :
+    1. TR calculé — position du prix dans le range
+    2. Equilibrium — entrée dans la bonne zone
+    3. Sweep — liquidité chassée avant l'entrée
+    4. CRT — momentum de la bougie actuelle confirmé
+
+    Retourne un dict avec le résultat de chaque filtre.
+    """
+    if len(candles) < 25:
+        return {"valide": False, "raison": "Pas assez de bougies"}
+
+    prix_actuel = candles[-1]["close"]
+    direction   = signal["direction"]
+
+    # ── 1. Trading Range ──
+    tr = calculer_trading_range(candles, periode=20)
+
+    # ── 2. Equilibrium ──
+    eq_ok = verifier_equilibrium(prix_actuel, tr, direction)
+
+    # ── 3. Sweep ──
+    sweep_ok = detecter_sweep(candles, direction, lookback=5)
+
+    # ── 4. CRT ──
+    crt      = detecter_crt(candles)
+    crt_ok   = (
+        (direction == "LONG"  and crt == "BULLISH") or
+        (direction == "SHORT" and crt == "BEARISH")
+    )
+
+    # ── Score ICT (0 à 4) ──
+    score = sum([eq_ok, sweep_ok, crt_ok, tr is not None])
+
+    # Valide si au moins 3 confirmations sur 4
+    valide = score >= 3
+
+    return {
+        "valide":      valide,
+        "score":       score,
+        "tr":          tr,
+        "eq_ok":       eq_ok,
+        "sweep_ok":    sweep_ok,
+        "crt":         crt,
+        "crt_ok":      crt_ok,
+        "prix_actuel": prix_actuel,
+        "raison":      (
+            "ICT OK (" + str(score) + "/4)" if valide
+            else "ICT insuffisant (" + str(score) + "/4 — EQ:" + str(eq_ok) +
+                 " Sweep:" + str(sweep_ok) + " CRT:" + str(crt_ok) + ")"
+        )
+    }
+
+
+# ═══════════════════════════════════════════════════════
 # DÉTECTION ORDER BLOCK (Crypto + Forex)
 # ═══════════════════════════════════════════════════════
 
@@ -398,9 +808,21 @@ def detecter_order_block(candles, nom_paire="BTC/USDT", type_marche="CRYPTO"):
             }
     return signal
 
-def fondamental_confirme(signal, fg, btc):
+def fondamental_confirme(signal, fg, btc, candles=None):
+    """
+    Confirmation combinée :
+    - Fondamentaux (Fear & Greed, momentum BTC)
+    - ICT (TR, Equilibrium, Sweep, CRT) si candles fournies
+    """
+    # ── ICT check (si candles disponibles) ──
+    if candles:
+        ict = confirmer_ict(candles, signal)
+        if not ict["valide"]:
+            print("[ICT] Rejeté — " + ict["raison"])
+            return False
+        signal["ict"] = ict   # stocker pour affichage dans le signal
+
     if signal["marche"] == "FOREX":
-        # Pour le Forex : on vérifie juste la force OB
         return signal["force"] >= 1.6
     if not fg or not btc:
         return False
@@ -550,6 +972,38 @@ STICKERS_MOTIV = ["💪", "🧠", "🎯", "⭐", "🏅", "🔑", "💡", "🙌"]
 # SIGNAL — FORMAT UNIFIÉ CRYPTO + FOREX
 # ═══════════════════════════════════════════════════════
 
+def construire_bloc_ict(signal):
+    """Construit le bloc ICT pour le message de signal."""
+    ict = signal.get("ict")
+    if not ict:
+        return ""
+
+    tr   = ict.get("tr")
+    lines = (
+        "📐  CONFIRMATION ICT\n"
+        "┌──────────────────────────────\n"
+        "│  " + ("✅" if ict.get("eq_ok")    else "❌") + " Equilibrium — zone discount/premium\n"
+        "│  " + ("✅" if ict.get("sweep_ok") else "❌") + " Sweep liquidity — chasse avant entrée\n"
+        "│  " + ("✅" if ict.get("crt_ok")   else "❌") + " CRT — breakout range bougie N-1\n"
+        "│  " + ("✅" if tr                  else "❌") + " Trading Range identifié\n"
+    )
+    if tr:
+        lines += (
+            "│\n"
+            "│  📊 TR High : " + str(round(tr["high"], 2)) + "\n"
+            "│  📊 TR Low  : " + str(round(tr["low"],  2)) + "\n"
+            "│  ⚖️  EQ (50%): " + str(round(tr["equilibrium"], 2)) + "\n"
+            "│  🔽 Discount : " + str(round(tr["discount"], 2)) + "\n"
+            "│  🔼 Premium  : " + str(round(tr["premium"],  2)) + "\n"
+        )
+    lines += (
+        "│\n"
+        "│  Score ICT : " + str(ict.get("score", 0)) + "/4 — " + ict.get("raison", "") + "\n"
+        "└──────────────────────────────\n\n"
+    )
+    return lines
+
+
 async def envoyer_signal_ob(bot, signal, fg, btc):
     rr        = round(abs(signal["tp1"] - signal["entree"]) /
                       max(abs(signal["entree"] - signal["sl"]), 0.00001), 2)
@@ -615,7 +1069,9 @@ async def envoyer_signal_ob(bot, signal, fg, btc):
         + "\n".join("│  " + l for l in bloc_fond.split("\n")) + "\n"
         "└──────────────────────────────\n\n"
 
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + construire_bloc_ict(signal)
+
+        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         + s_motiv + "  MINDSET DU TRADER\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\"" + citation + "\"\n"
@@ -632,8 +1088,8 @@ async def envoyer_signal_ob(bot, signal, fg, btc):
     )
     await bot.send_message(chat_id=CHANNEL_ID, text=msg)
 
-    # ── Exécution trade Binance automatique ──
-    executer_trade_binance(signal)
+    # ── Exécution trade Futures automatique (crypto uniquement) ──
+    await executer_trade_binance(signal, bot)
 
     # ── Alerte email ──
     envoyer_email(
@@ -693,32 +1149,35 @@ async def scanner_order_blocks(bot):
             signal  = detecter_order_block(candles, paire["nom"], "FOREX")
             if signal:
                 print("[SCANNER GOLD/FOREX] Signal : " + signal["paire"] + " — " + signal["type"])
-                if fondamental_confirme(signal, fg, btc):
-                    print("[SCANNER] ✅ Confirme — Envoi sur groupe")
+                if fondamental_confirme(signal, fg, btc, candles):
+                    print("[SCANNER] ✅ ICT+Fondamental OK — Envoi sur groupe")
                     await envoyer_signal_ob(bot, signal, fg, btc)
                     signaux_envoyes += 1
                     await asyncio.sleep(5)
                 else:
-                    print("[SCANNER] " + signal["paire"] + " signal faible — ignore")
+                    print("[SCANNER] " + signal["paire"] + " — rejeté ICT ou fondamental")
         except Exception as e:
             print("[SCANNER FOREX ERROR] " + paire["nom"] + " : " + str(e))
 
-    # ── PRIORITÉ 2 : BTC (référence, seulement si fort et quota pas atteint) ──
-    if signaux_envoyes < MAX_SIGNAUX_PAR_SCAN:
+    # ── PRIORITÉ 2 : CRYPTO (BTC / ETH / SOL) — signal + trade auto ──
+    for paire in PAIRES_CRYPTO:
+        if signaux_envoyes >= MAX_SIGNAUX_PAR_SCAN:
+            break
         try:
-            candles = get_candles("BTCUSDT", interval="1h", limit=50)
-            signal  = detecter_order_block(candles, "BTC/USDT", "CRYPTO")
-            if signal and signal.get("force", 0) >= 2.0:   # Seulement si OB très fort
-                if fondamental_confirme(signal, fg, btc):
-                    print("[SCANNER BTC] Signal fort — Envoi sur groupe")
+            candles = get_candles(paire["symbol"], interval="1h", limit=50)
+            signal  = detecter_order_block(candles, paire["nom"], "CRYPTO")
+            if signal and signal.get("force", 0) >= 1.8:
+                if fondamental_confirme(signal, fg, btc, candles):
+                    print("[SCANNER CRYPTO] ✅ OB+ICT confirmé — " + paire["nom"])
                     await envoyer_signal_ob(bot, signal, fg, btc)
                     signaux_envoyes += 1
+                    await asyncio.sleep(3)
                 else:
-                    print("[SCANNER BTC] Non confirmé — ignoré")
+                    print("[SCANNER CRYPTO] " + paire["nom"] + " — rejeté ICT ou fondamental")
             else:
-                print("[SCANNER BTC] Pas de signal fort — pas d'envoi")
+                print("[SCANNER CRYPTO] " + paire["nom"] + " — OB insuffisant")
         except Exception as e:
-            print("[SCANNER BTC ERROR] " + str(e))
+            print("[SCANNER CRYPTO ERROR] " + paire["nom"] + " : " + str(e))
 
     print("[SCANNER] Scan terminé — " + str(signaux_envoyes) + " signal(s) envoyé(s).")
 
@@ -2126,4 +2585,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
