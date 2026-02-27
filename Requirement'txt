@@ -1,1 +1,33 @@
 
+# ═══════════════════════════════════════════════════════
+# AlphaBot Pro V8 — requirements.txt
+# Commande : pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════
+
+# ─── Telegram Bot ───────────────────────────────────────
+python-telegram-bot==20.7
+
+# ─── Requêtes HTTP (API Binance, Forex, Fear&Greed) ────
+requests
+
+# ─── Fix asyncio boucle événements ─────────────────────
+nest_asyncio
+
+# ─── Trading Binance Futures ────────────────────────────
+# Activer dans le bot : BINANCE_TRADING_ACTIF = True
+python-binance
+
+# ════════════════════════════════════════════════════════
+# MODULES NATIFS PYTHON — PAS À INSTALLER
+# (déjà inclus dans toute installation Python 3.10+)
+# ════════════════════════════════════════════════════════
+# asyncio         — boucle async
+# random          — sélection aléatoire citations/images
+# json            — base de données locale
+# os              — accès fichiers
+# statistics      — calcul moyenne corps bougies
+# datetime        — dates et planificateur
+# smtplib         — envoi email
+# threading       — serveur keep-alive en parallèle
+# http.server     — serveur HTTP keep-alive Render.com
+# email.mime      — formatage emails HTML/texte
