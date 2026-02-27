@@ -438,6 +438,29 @@ PAIRES_FOREX = [
 # BASE DE DONNÉES
 # ═══════════════════════════════════════════════════════
 
+
+def generer_code_affiliation(uid):
+    return "ALPHA" + str(uid)[-5:].upper()
+
+def generer_lien_affiliation(uid):
+    code = generer_code_affiliation(uid)
+    return "https://t.me/" + BOT_USERNAME + "?start=" + code, code
+
+def activer_vip_auto(uid, jours, db, raison="parrainage"):
+    uid = str(uid)
+    db.setdefault("vip_members", {})
+    if uid in db["vip_members"] and db["vip_members"][uid].get("active"):
+        try:
+            expiry = datetime.fromisoformat(db["vip_members"][uid]["expiry"])
+            expiry = max(expiry, datetime.now()) + timedelta(days=jours)
+        except Exception:
+            expiry = datetime.now() + timedelta(days=jours)
+    else:
+        expiry = datetime.now() + timedelta(days=jours)
+    db["vip_members"][uid] = {"expiry": expiry.isoformat(), "raison": raison, "active": True}
+    save_db(db)
+    return expiry
+
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -830,6 +853,66 @@ def fondamental_confirme(signal, fg, btc, candles=None):
         return fg["value"] >= 40 and btc["change"] > 0.3
     return fg["value"] <= 60 and btc["change"] < -0.3
 
+
+# ═══════════════════════════════════════════════════════
+# BANQUE D'IMAGES AUTOMATIQUE
+# ═══════════════════════════════════════════════════════
+IMAGES_GOLD = [
+    "https://images.unsplash.com/photo-1610375461246-83df859d849d?w=800",
+    "https://images.unsplash.com/photo-1624365169198-38255ba54160?w=800",
+    "https://images.unsplash.com/photo-1607603750909-408681023b86?w=800",
+    "https://images.unsplash.com/photo-1618044733300-9472054094ee?w=800",
+]
+IMAGES_LONG = [
+    "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=800",
+    "https://images.unsplash.com/photo-1560221328-12fe60f83ab8?w=800",
+    "https://images.unsplash.com/photo-1569025690938-a00729c9e1f9?w=800",
+    "https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800",
+]
+IMAGES_SHORT = [
+    "https://images.unsplash.com/photo-1504639725590-34d0984388bd?w=800",
+    "https://images.unsplash.com/photo-1535320903710-d993d3d77d29?w=800",
+    "https://images.unsplash.com/photo-1559526324-593bc073d938?w=800",
+]
+IMAGES_MATIN = [
+    "https://images.unsplash.com/photo-1642790106117-e829e14a795f?w=800",
+    "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800",
+    "https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?w=800",
+    "https://images.unsplash.com/photo-1580273916550-e323be2ae537?w=800",
+]
+IMAGES_MOTIVATION = [
+    "https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?w=800",
+    "https://images.unsplash.com/photo-1620321023374-d1a68fbc720d?w=800",
+    "https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=800",
+]
+IMAGES_LANCEMENT = [
+    "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?w=800",
+    "https://images.unsplash.com/photo-1643101809204-6fb869816dbe?w=800",
+    "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=800",
+]
+
+def choisir_image(signal=None, contexte="crypto"):
+    if signal:
+        p = signal.get("paire", "")
+        if "Or" in p or "XAU" in p:   return random.choice(IMAGES_GOLD)
+        if signal.get("direction") == "LONG":  return random.choice(IMAGES_LONG)
+        if signal.get("direction") == "SHORT": return random.choice(IMAGES_SHORT)
+    if contexte == "matin":      return random.choice(IMAGES_MATIN)
+    if contexte == "motivation": return random.choice(IMAGES_MOTIVATION)
+    if contexte == "lancement":  return random.choice(IMAGES_LANCEMENT)
+    return random.choice(IMAGES_LONG)
+
+async def envoyer_avec_image(bot, chat_id, texte, signal=None, contexte="crypto"):
+    """Envoie avec image automatique — fallback texte si erreur."""
+    for _ in range(2):
+        try:
+            img = choisir_image(signal, contexte)
+            await bot.send_photo(chat_id=chat_id, photo=img, caption=texte[:1024])
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id=chat_id, text=texte)
+
 # ═══════════════════════════════════════════════════════
 # CITATIONS MOTIVATION
 # ═══════════════════════════════════════════════════════
@@ -1110,77 +1193,60 @@ async def envoyer_signal_ob(bot, signal, fg, btc):
 # SCANNER MULTI-PAIRES (CRYPTO + FOREX)
 # ═══════════════════════════════════════════════════════
 
+async def get_top100_crypto_binance():
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10)
+        tickers = [t for t in r.json() if t["symbol"].endswith("USDT")]
+        tickers = sorted(tickers, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        return [{"symbol": t["symbol"], "nom": t["symbol"].replace("USDT", "/USDT"), "emoji": "₿"} for t in tickers[:100]]
+    except Exception as e:
+        print("[TOP100] Fallback : " + str(e))
+        return [{"symbol": s+"USDT", "nom": s+"/USDT", "emoji": "₿"}
+                for s in ["BTC","ETH","SOL","BNB","XRP","DOGE","ADA","AVAX","DOT","LTC",
+                           "MATIC","LINK","UNI","ATOM","FIL","NEAR","APT","ARB","OP","SUI"]]
+
 async def scanner_order_blocks(bot):
-    """
-    Ordre de priorité des signaux envoyés sur le GROUPE :
-    1. XAU/USD (Or)  ← priorité absolue
-    2. GBP/USD
-    3. EUR/USD
-    4. USD/JPY
-    5. USD/CHF
-    6. BTC/USDT      ← en dernier, uniquement si signal très fort
-    """
-    print("[SCANNER] Analyse en cours — priorité Gold & Forex...")
+    """Gold priorité absolue + Top 100 crypto Binance."""
+    print("[SCANNER] Gold + Top 100 crypto...")
     btc = get_btc()
     fg  = get_fear_greed()
-    signaux_envoyes = 0
-    MAX_SIGNAUX_PAR_SCAN = 3   # Max 3 signaux par heure pour ne pas spammer
+    signaux = 0
+    MAX     = 3
 
-    # ── PRIORITÉ 1 : GOLD + FOREX (signaux principaux du groupe) ──
-    FOREX_PRIORITAIRE = [
-        {"symbol": "XAUUSDT",  "nom": "XAU/USD (Or)", "emoji": "🥇"},  # GOLD en premier
-        {"symbol": "GBPUSDT",  "nom": "GBP/USD",       "emoji": "🇬🇧"},
-        {"symbol": "EURUSDT",  "nom": "EUR/USD",        "emoji": "🇪🇺"},
-        {"symbol": "USDUSDT",  "nom": "USD/JPY",        "emoji": "🇯🇵"},  # approx via BINANCE
-        {"symbol": "USDCHF",   "nom": "USD/CHF",        "emoji": "🇨🇭"},
-    ]
-    # Correction : JPY et CHF via paires disponibles sur Binance
-    FOREX_PRIORITAIRE = [
-        {"symbol": "XAUUSDT",  "nom": "XAU/USD (Or)", "emoji": "🥇"},
-        {"symbol": "GBPUSDT",  "nom": "GBP/USD",       "emoji": "🇬🇧"},
-        {"symbol": "EURUSDT",  "nom": "EUR/USD",        "emoji": "🇪🇺"},
-    ]
+    # ── 1. GOLD XAU/USD ──
+    try:
+        c = get_candles("XAUUSDT", interval="1h", limit=50)
+        s = detecter_order_block(c, "XAU/USD (Or)", "FOREX")
+        if s and fondamental_confirme(s, fg, btc, c):
+            print("[GOLD] ✅ Signal confirmé")
+            await envoyer_signal_ob(bot, s, fg, btc)
+            signaux += 1
+            await asyncio.sleep(5)
+        else:
+            print("[GOLD] Pas de signal validé")
+    except Exception as e:
+        print("[GOLD ERROR] " + str(e))
 
-    for paire in FOREX_PRIORITAIRE:
-        if signaux_envoyes >= MAX_SIGNAUX_PAR_SCAN:
-            break
-        try:
-            candles = get_candles(paire["symbol"], interval="1h", limit=50)
-            signal  = detecter_order_block(candles, paire["nom"], "FOREX")
-            if signal:
-                print("[SCANNER GOLD/FOREX] Signal : " + signal["paire"] + " — " + signal["type"])
-                if fondamental_confirme(signal, fg, btc, candles):
-                    print("[SCANNER] ✅ ICT+Fondamental OK — Envoi sur groupe")
-                    await envoyer_signal_ob(bot, signal, fg, btc)
-                    signaux_envoyes += 1
-                    await asyncio.sleep(5)
-                else:
-                    print("[SCANNER] " + signal["paire"] + " — rejeté ICT ou fondamental")
-        except Exception as e:
-            print("[SCANNER FOREX ERROR] " + paire["nom"] + " : " + str(e))
-
-    # ── PRIORITÉ 2 : CRYPTO (BTC / ETH / SOL) — signal + trade auto ──
-    for paire in PAIRES_CRYPTO:
-        if signaux_envoyes >= MAX_SIGNAUX_PAR_SCAN:
-            break
-        try:
-            candles = get_candles(paire["symbol"], interval="1h", limit=50)
-            signal  = detecter_order_block(candles, paire["nom"], "CRYPTO")
-            if signal and signal.get("force", 0) >= 1.8:
-                if fondamental_confirme(signal, fg, btc, candles):
-                    print("[SCANNER CRYPTO] ✅ OB+ICT confirmé — " + paire["nom"])
-                    await envoyer_signal_ob(bot, signal, fg, btc)
-                    signaux_envoyes += 1
+    # ── 2. TOP 100 CRYPTO ──
+    if signaux < MAX:
+        top100 = await get_top100_crypto_binance()
+        print("[TOP100] " + str(len(top100)) + " paires en cours...")
+        for paire in top100:
+            if signaux >= MAX:
+                break
+            try:
+                c = get_candles(paire["symbol"], interval="1h", limit=50)
+                s = detecter_order_block(c, paire["nom"], "CRYPTO")
+                if s and s.get("force", 0) >= 1.8 and fondamental_confirme(s, fg, btc, c):
+                    print("[TOP100] ✅ " + paire["nom"])
+                    await envoyer_signal_ob(bot, s, fg, btc)
+                    signaux += 1
                     await asyncio.sleep(3)
-                else:
-                    print("[SCANNER CRYPTO] " + paire["nom"] + " — rejeté ICT ou fondamental")
-            else:
-                print("[SCANNER CRYPTO] " + paire["nom"] + " — OB insuffisant")
-        except Exception as e:
-            print("[SCANNER CRYPTO ERROR] " + paire["nom"] + " : " + str(e))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
 
-    print("[SCANNER] Scan terminé — " + str(signaux_envoyes) + " signal(s) envoyé(s).")
-
+    print("[SCANNER] Fin — " + str(signaux) + " signal(s).")
 
 # ═══════════════════════════════════════════════════════
 # MESSAGES CANAL
@@ -1342,124 +1408,59 @@ async def envoyer_rappel_communaute(bot):
 
 
 async def envoyer_bienvenue_lancement(bot):
-    btc = get_btc()
-    fg  = get_fear_greed()
-    now = datetime.now()
-    citation, auteur = random.choice(MOTIVATIONS)
+    """Envoyé au démarrage — 3 messages avec images."""
+    btc    = get_btc()
+    fg     = get_fear_greed()
+    now    = datetime.now()
+    fg_val = fg["value"] if fg else 50
 
-    # ── MESSAGE 1 : Présentation naturelle ──
     msg1 = (
-        "⚡ BIENVENUE SUR ALPHABOT PRO ⚡\n"
+        "⚡ ALPHABOT PRO — EN LIGNE\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Je suis Leader — trader professionnel actif sur les marchés mondiaux.\n\n"
-        "Après des années de trading sur les Crypto Futures et le Forex, "
-        "j'ai créé ce groupe pour partager mes signaux avec une communauté sérieuse.\n\n"
-        "Pas pour vendre du rêve. Pour trader ensemble — avec discipline et méthode.\n\n"
+        "Je suis @leaderOdg — trader professionnel.\n"
+        "Ce bot partage mes signaux en temps réel.\n\n"
+        "📡 CE QU'ON SCANNE :\n"
+        "🥇 XAU/USD (Or) — priorité absolue\n"
+        "₿  Top 100 Crypto Futures Binance\n\n"
+        "✅ Validation : OB + ICT (TR / EQ / Sweep / CRT)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "CE QU'ON FAIT ICI :\n\n"
-        "✅ Signaux gratuits — Crypto & Forex\n"
-        "✅ Éducation — Order Block / Smart Money\n"
-        "✅ Gestion du risque — capital protégé\n"
-        "✅ Résultats constants, pas des coups\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "CE QU'ON TRADE :\n\n"
-        "₿  Crypto Futures : BTC, ETH, SOL, BNB, XRP\n"
-        "🌍 Forex : EUR/USD, GBP/USD, XAU/USD (Or)\n"
-        "📡 Scanner automatique — 24h/24\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💎 VIP : 5$/mois ou 50$ dépôt unique\n"
+        "🤝 1 ami parrainé = 7 jours VIP offerts\n"
+        "🔗 Tape /affiliation pour ton lien unique\n\n"
         "— @leaderOdg"
     )
-    await bot.send_message(chat_id=CHANNEL_ID, text=msg1)
-    await asyncio.sleep(3)
+    await envoyer_avec_image(bot, CHANNEL_ID, msg1, contexte="lancement")
+    await asyncio.sleep(4)
 
-    # ── MESSAGE 2 : Motivation naturelle ──
-    citation2, auteur2 = random.choice(MOTIVATIONS)
     msg2 = (
-        "💪 MINDSET DU TRADER\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "La majorité des gens regardent les marchés monter sans jamais passer à l'action.\n\n"
-        "Ils attendent le bon moment... qui ne vient jamais.\n\n"
-        "Ceux qui réussissent ont un système, respectent le risque, et tiennent leur plan.\n\n"
-        "Tu es ici. C'est déjà un pas dans la bonne direction. 🚀\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\"" + citation2 + "\"\n"
-        "  — " + auteur2 + "\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "LES 5 RÈGLES D'OR :\n\n"
-        "1️⃣  Ne risque jamais plus de 2% par trade\n"
-        "2️⃣  Pose toujours ton Stop Loss avant d'entrer\n"
-        "3️⃣  Suis le signal — pas tes émotions\n"
-        "4️⃣  TP1 atteint ? Sécurise une partie\n"
-        "5️⃣  Patience. La régularité bat tout.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "AlphaBot Pro — @leaderOdg"
-    )
-    await bot.send_message(chat_id=CHANNEL_ID, text=msg2)
-    await asyncio.sleep(3)
-
-    # ── MESSAGE 3 : Bot en ligne + depot ──
-    msg3 = (
-        "📡 BOT EN LIGNE — " + now.strftime("%d/%m/%Y %H:%M") + "\n"
+        "📊 MARCHÉ EN DIRECT — " + now.strftime("%d/%m/%Y %H:%M") + "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         + ligne_btc(btc) + "\n"
-        + fg_emoji(fg["value"]) + " Fear & Greed : " + str(fg["value"]) + " — " + fg_label(fg["value"]) + "\n\n"
+        + fg_emoji(fg_val) + " Fear & Greed : " + str(fg_val) + " — " + fg_label(fg_val) + "\n\n"
+        "🔔 Scanner actif — signaux toutes les heures\n"
+        "📅 Analyses : 07h | 12h | 18h | 21h\n\n"
+        "Pas un conseil financier.\n"
+        "📡 " + LIEN_GROUPE
+    )
+    await envoyer_avec_image(bot, CHANNEL_ID, msg2, contexte="matin")
+    await asyncio.sleep(4)
+
+    citation, auteur = random.choice(MOTIVATIONS)
+    msg3 = (
+        "🧠 LES 5 RÈGLES DU TRADER\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣  Ne risque jamais plus de 1-2% par trade\n"
+        "2️⃣  Stop Loss AVANT d'entrer\n"
+        "3️⃣  Suis le signal — pas les émotions\n"
+        "4️⃣  TP1 atteint → sécurise une partie\n"
+        "5️⃣  La régularité bat les coups de chance\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔔 COMMENT FONCTIONNE LE BOT :\n"
-        "┌──────────────────────────────\n"
-        "│  📡 Scan Order Block toutes les heures\n"
-        "│  ₿  Crypto : BTC, ETH, SOL, BNB, XRP\n"
-        "│  🌍 Forex  : EUR/USD, GBP/USD, XAU/USD\n"
-        "│  ✅ Signal envoye seulement si confirme\n"
-        "│  💬 Analyses : 07h, 12h, 18h, 21h\n"
-        "│  💪 Motivation : 10h et 15h\n"
-        "└──────────────────────────────\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💎 ACCES VIP — " + CANAL_VIP + "\n"
-        "┌──────────────────────────────\n"
-        "│  → 5 USDT/mois\n"
-        "│  → 50 USDT depot unique (recommande)\n"
-        "│  → 1 ami parraine = 7 jours VIP OFFERTS\n"
-        "└──────────────────────────────\n\n"
-        "💳 DEPOT USDT TRC-20 :\n"
-        + ADRESSE_TRC20 + "\n\n"
-        "📩 Apres depot → envoie hash TX a @leaderOdg\n"
-        "⏱️  Acces active sous 24h max\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📡 Groupe : " + LIEN_GROUPE + "\n"
-        "💎 VIP : " + CANAL_VIP + "\n"
-        "🤝 /affiliation  |  💳 /payer  |  ℹ️ /vip\n\n"
-        "⚠️  Pas un conseil financier.\n"
+        "\"" + citation + "\"\n"
+        "  — " + auteur + "\n\n"
         "AlphaBot Pro — @leaderOdg"
     )
-    await bot.send_message(chat_id=CHANNEL_ID, text=msg3)
+    await envoyer_avec_image(bot, CHANNEL_ID, msg3, contexte="motivation")
 
-    # ── MESSAGE 4 : Image de motivation crypto ──
-    await asyncio.sleep(2)
-    images_motivation = [
-        "https://i.imgur.com/4XqpP8Q.jpg",   # graphique crypto bull
-    ]
-    legende_img = (
-        "📊 Le marché ne dort jamais. Ton scanner non plus.\n\n"
-        "💎 VIP : " + CANAL_VIP + "\n"
-        "📡 Gratuit : " + LIEN_GROUPE + "\n"
-        "🤝 Parraine 1 ami → 7 jours VIP offerts !"
-    )
-    try:
-        await bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo="https://i.imgur.com/4XqpP8Q.jpg",
-            caption=legende_img
-        )
-    except Exception:
-        # Si l'image ne charge pas, on envoie juste le texte
-        await bot.send_message(chat_id=CHANNEL_ID, text=legende_img)
-
-    print("[BOT] Messages de bienvenue envoyes (4 blocs)")
-
-
-# ═══════════════════════════════════════════════════════
-# HANDLER VOCAL
-# ═══════════════════════════════════════════════════════
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1525,18 +1526,20 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for uid, aff in db["affilies"].items():
             if aff["code"] == args[0] and str(user.id) != uid:
                 jours_vip = enregistrer_parrainage(uid)
+                db_vip = load_db()
+                expiry = activer_vip_auto(uid, JOURS_VIP_PAR_PARRAINAGE, db_vip, "parrainage")
+                expiry_str = expiry.strftime("%d/%m/%Y")
                 try:
                     await ctx.bot.send_message(
                         chat_id=int(uid),
                         text=(
-                            "🎉 Nouveau filleul — " + user.first_name + " vient de rejoindre !\n\n"
-                            "🎁 RECOMPENSE : " + str(JOURS_VIP_PAR_PARRAINAGE) + " jours VIP OFFERTS !\n"
-                            "Total VIP cumule : " + str(jours_vip) + " jours\n\n"
-                            "📩 Contacte " + ADMIN_USERNAME + " pour activer ton VIP.\n"
-                            "Continue a partager pour en gagner encore !"
+                            "🎉 Filleul — " + user.first_name + " rejoint !\n\n"
+                            "✅ VIP ACTIVÉ AUTOMATIQUEMENT\n"
+                            "+" + str(JOURS_VIP_PAR_PARRAINAGE) + " jours VIP — expire le " + expiry_str + "\n"
+                            "Accès VIP : " + CANAL_VIP + "\n"
                         )
                     )
-                except:
+                except Exception:
                     pass
                 break
 
