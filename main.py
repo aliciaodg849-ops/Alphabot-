@@ -1,4 +1,4 @@
-6 # ╔══════════════════════════════════════════════════════════════╗
+# ╔══════════════════════════════════════════════════════════════╗
 # ║   ALPHABOT — STYLE UCHE Trade&Gagne                         ║
 # ║   Signaux M1 ICT + Témoignages + Services + Urgence VIP     ║
 # ║   pip install requests yfinance pyTelegramBotAPI schedule    ║
@@ -600,6 +600,51 @@ def run_schedule():
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  SERVEUR WEB (requis pour Render free tier)
+# ══════════════════════════════════════════════════════════════
+
+from flask import Flask
+import os
+
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    h = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    sess = get_session() or "hors session"
+    return (
+        f"<h2>AlphaBot — {CANAL_NAME}</h2>"
+        f"<p>Statut : <b>ACTIF</b></p>"
+        f"<p>Heure : {h}</p>"
+        f"<p>Session : {sess.upper()}</p>"
+        f"<p>Signaux cette heure : {_signals_this_hour}/{MAX_SIGNALS_HOUR}</p>"
+        f"<p>Messages cette heure : {_messages_this_hour}/{MAX_MESSAGES_HOUR}</p>"
+        f"<p>Score minimum : {MIN_SCORE}%  |  RR min : 1:{MIN_RR}</p>"
+    )
+
+@flask_app.route("/ping")
+def ping():
+    return "pong", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+def keep_alive():
+    """Ping le serveur toutes les 10 min pour eviter la mise en veille Render."""
+    import requests as req
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        return
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            req.get(f"{render_url}/ping", timeout=10)
+            print("[PING] Keep-alive OK")
+        except:
+            pass
+
 if __name__ == "__main__":
     print("="*54)
     print("  ALPHABOT — STYLE UCHE Trade&Gagne")
@@ -611,6 +656,8 @@ if __name__ == "__main__":
     print("="*54)
     setup_schedule()
     threading.Thread(target=run_schedule, daemon=True).start()
+    threading.Thread(target=keep_alive,   daemon=True).start()
+    threading.Thread(target=run_flask,    daemon=True).start()
     scan_once()
     while True:
         time.sleep(SCAN_EVERY)
