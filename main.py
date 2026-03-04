@@ -1,12 +1,14 @@
 # ╔══════════════════════════════════════════════════════════════╗
 # ║   ALPHABOT — STYLE UCHE Trade&Gagne                         ║
 # ║   Signaux M1 ICT + Témoignages + Services + Urgence VIP     ║
-# ║   pip install requests yfinance pyTelegramBotAPI schedule    ║
+# ║   pip install requests yfinance pyTelegramBotAPI schedule flask PIL ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 import requests, time, io, schedule, threading, random
 from datetime import datetime, timezone
 import yfinance as yf
+import telebot
+from telebot import types
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -50,9 +52,23 @@ PAIRS = {
 #  ETAT — COMPTEURS HORAIRES
 # ══════════════════════════════════════════════════════════════
 
-cooldowns  = {}
-daily_wins = []
-BASE_URL   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+cooldowns   = {}
+daily_wins  = []
+BASE_URL    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# ── Anti-spam : empreintes des derniers signaux (24h) ─────────
+sent_signal_hashes = {}   # hash -> timestamp
+ANTI_SPAM_MINUTES  = 90   # ignore signal similaire dans les 90 min
+
+# ── Trades ouverts : suivi pour alerte TP/SL ──────────────────
+# { trade_id : {label, side, entry, sl, tp1, tp2, symbol, status} }
+open_trades = {}
+_trade_counter = 0
+
+def new_trade_id():
+    global _trade_counter
+    _trade_counter += 1
+    return _trade_counter
 
 # Compteurs par heure (reset automatique chaque nouvelle heure)
 _current_hour       = -1
@@ -90,6 +106,32 @@ def register_signal():
 def register_message():
     global _messages_this_hour
     _messages_this_hour += 1
+
+# ══════════════════════════════════════════════════════════════
+#  ANTI-SPAM SIGNAUX
+# ══════════════════════════════════════════════════════════════
+
+def _signal_hash(label, side):
+    """Empreinte unique : paire + direction."""
+    return f"{label}:{side}"
+
+def is_duplicate_signal(label, side):
+    """Retourne True si un signal identique a deja ete envoye recemment."""
+    key = _signal_hash(label, side)
+    now = time.time()
+    # Nettoie les vieilles entrees
+    expired = [k for k, t in sent_signal_hashes.items() if now - t > ANTI_SPAM_MINUTES * 60]
+    for k in expired:
+        del sent_signal_hashes[k]
+    if key in sent_signal_hashes:
+        elapsed = int((now - sent_signal_hashes[key]) / 60)
+        print(f"[ANTISPAM] {label} {side} — doublon ignore ({elapsed} min depuis dernier envoi)")
+        return True
+    return False
+
+def register_sent_signal(label, side):
+    """Enregistre l'empreinte du signal envoye."""
+    sent_signal_hashes[_signal_hash(label, side)] = time.time()
 
 # ══════════════════════════════════════════════════════════════
 #  TELEGRAM
@@ -239,16 +281,124 @@ def make_motivation_img(titre, corps):
 #  DONNEES M1 + DETECTION ICT BREAKER BLOCK
 # ══════════════════════════════════════════════════════════════
 
-def get_candles(symbol, n=120):
+# ── Mapping symboles vers Twelve Data ─────────────────────────
+TWELVEDATA_SYMBOLS = {
+    "EURUSD=X": "EUR/USD",
+    "GBPUSD=X": "GBP/USD",
+    "USDJPY=X": "USD/JPY",
+    "GBPJPY=X": "GBP/JPY",
+    "XAUUSD=X": "XAU/USD",
+    "AUDUSD=X": "AUD/USD",
+    "CADJPY=X": "CAD/JPY",
+}
+
+def _get_candles_yfinance(symbol, n=120):
+    """Tentative yfinance avec retry x3."""
+    for attempt in range(3):
+        try:
+            time.sleep(attempt * 2)  # backoff
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="2d", interval="1m")
+            if df is not None and not df.empty and len(df) >= 30:
+                df = df.tail(n)
+                return [{"open": float(r["Open"]), "high": float(r["High"]),
+                         "low":  float(r["Low"]),  "close": float(r["Close"])}
+                        for _, r in df.iterrows()]
+        except Exception as e:
+            print(f"[yfinance] {symbol} tentative {attempt+1}/3 : {e}")
+    return []
+
+def _get_candles_twelvedata(symbol, n=120):
+    """Fallback : API Twelve Data (gratuite, sans cle pour forex)."""
+    td_symbol = TWELVEDATA_SYMBOLS.get(symbol)
+    if not td_symbol:
+        return []
     try:
-        df=yf.Ticker(symbol).history(period="1d",interval="1m")
-        if df.empty or len(df)<30: return []
-        df=df.tail(n)
-        return [{"open":float(r["Open"]),"high":float(r["High"]),
-                 "low":float(r["Low"]),"close":float(r["Close"])}
-                for _,r in df.iterrows()]
+        url = (f"https://api.twelvedata.com/time_series"
+               f"?symbol={td_symbol}&interval=1min&outputsize={n}&format=JSON")
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("status") == "error" or "values" not in data:
+            print(f"[TwelveData] {symbol}: {data.get('message','erreur inconnue')}")
+            return []
+        candles = []
+        for c in reversed(data["values"]):  # plus ancien en premier
+            try:
+                candles.append({
+                    "open":  float(c["open"]),
+                    "high":  float(c["high"]),
+                    "low":   float(c["low"]),
+                    "close": float(c["close"]),
+                })
+            except Exception:
+                continue
+        if len(candles) >= 30:
+            print(f"[TwelveData] {symbol}: {len(candles)} bougies OK")
+            return candles
     except Exception as e:
-        print(f"[DATA] {symbol}: {e}"); return []
+        print(f"[TwelveData] {symbol}: {e}")
+    return []
+
+def _get_candles_stooq(symbol, n=120):
+    """Fallback 2 : Stooq (pas de cle requise)."""
+    stooq_map = {
+        "EURUSD=X": "eurusd",
+        "GBPUSD=X": "gbpusd",
+        "USDJPY=X": "usdjpy",
+        "GBPJPY=X": "gbpjpy",
+        "XAUUSD=X": "xauusd",
+        "AUDUSD=X": "audusd",
+        "CADJPY=X": "cadjpy",
+    }
+    sym = stooq_map.get(symbol)
+    if not sym:
+        return []
+    try:
+        url = f"https://stooq.com/q/d/l/?s={sym}&i=m"
+        r = requests.get(url, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        lines = r.text.strip().split("\n")
+        if len(lines) < 5:
+            return []
+        candles = []
+        for row in lines[-n:]:
+            parts = row.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                candles.append({
+                    "open":  float(parts[1]),
+                    "high":  float(parts[2]),
+                    "low":   float(parts[3]),
+                    "close": float(parts[4]),
+                })
+            except Exception:
+                continue
+        if len(candles) >= 30:
+            print(f"[Stooq] {symbol}: {len(candles)} bougies OK")
+            return candles
+    except Exception as e:
+        print(f"[Stooq] {symbol}: {e}")
+    return []
+
+def get_candles(symbol, n=120):
+    """Récupère les bougies M1 — yfinance → TwelveData → Stooq."""
+    # 1. yfinance
+    candles = _get_candles_yfinance(symbol, n)
+    if candles:
+        return candles
+    # 2. Twelve Data
+    print(f"[DATA] {symbol}: yfinance KO — tentative TwelveData")
+    candles = _get_candles_twelvedata(symbol, n)
+    if candles:
+        return candles
+    # 3. Stooq
+    print(f"[DATA] {symbol}: TwelveData KO — tentative Stooq")
+    candles = _get_candles_stooq(symbol, n)
+    if candles:
+        return candles
+    print(f"[DATA] {symbol}: toutes sources KO — skip")
+    return []
 
 def detect_breaker(candles, vol_pct):
     if len(candles)<25: return None
@@ -319,7 +469,10 @@ def get_session():
 #  ENVOI SIGNAL — FORMAT UCHE EXACT
 # ══════════════════════════════════════════════════════════════
 
-def send_signal(label, side, entry, sl, tp1, tp2, rr, score, session):
+def send_signal(label, side, entry, sl, tp1, tp2, rr, score, session, symbol=None):
+    # ── Anti-spam : ignore les doublons ───────────────────────
+    if is_duplicate_signal(label, side):
+        return
     def fp(v):
         if v>=100: return f"{v:.3f}"
         if v>=1:   return f"{v:.5f}"
@@ -375,8 +528,18 @@ def send_signal(label, side, entry, sl, tp1, tp2, rr, score, session):
 
     gain_est=abs(tp1-entry)*10000*2.5
     daily_wins.append({"pair":label,"direction":side,"gain":round(gain_est,2)})
-    register_signal()  # compteur horaire
-    print(f"[SENT] {label} {side} {heure} | RR 1:{rr} | Score {score}%")
+    register_signal()   # compteur horaire
+    register_sent_signal(label, side)  # anti-spam
+
+    # ── Enregistre le trade ouvert pour suivi TP/SL ───────────
+    tid = new_trade_id()
+    open_trades[tid] = {
+        "label": label, "side": side, "entry": entry,
+        "sl": sl, "tp1": tp1, "tp2": tp2,
+        "symbol": symbol or label, "tp1_hit": False,
+        "opened_at": time.time()
+    }
+    print(f"[SENT] {label} {side} {heure} | RR 1:{rr} | Score {score}% | Trade ID #{tid}")
 
 # ══════════════════════════════════════════════════════════════
 #  POSTS MARKETING — STYLE UCHE EXACT (3 formats)
@@ -523,8 +686,272 @@ def post_resultats_jour():
     print(f"[RESULTS] {nb} trades — total +{total:.2f}$")
 
 # ══════════════════════════════════════════════════════════════
-#  SCANNER
+#  MONITEUR DE TRADES — ALERTE TP / SL
 # ══════════════════════════════════════════════════════════════
+
+def fp(v):
+    if v >= 100: return f"{v:.3f}"
+    if v >= 1:   return f"{v:.5f}"
+    return f"{v:.6f}"
+
+def _get_live_price(symbol):
+    """Récupère le prix actuel — yfinance → TwelveData → Stooq."""
+    # 1. yfinance fast_info
+    try:
+        p = float(yf.Ticker(symbol).fast_info["last_price"])
+        if p and p > 0:
+            return p
+    except Exception:
+        pass
+    # 2. Dernière bougie TwelveData
+    candles = _get_candles_twelvedata(symbol, n=1)
+    if candles:
+        return candles[-1]["close"]
+    # 3. Dernière bougie Stooq
+    candles = _get_candles_stooq(symbol, n=5)
+    if candles:
+        return candles[-1]["close"]
+    return None
+
+def check_open_trades():
+    """Surveille les trades ouverts et envoie une alerte si TP1/TP2/SL est touche."""
+    if not open_trades:
+        return
+    closed = []
+    for tid, t in open_trades.items():
+        symbol_key = None
+        for sym, meta in PAIRS.items():
+            if meta["label"] == t["label"]:
+                symbol_key = sym; break
+        if not symbol_key:
+            continue
+        try:
+            price = _get_live_price(symbol_key)
+            if price is None:
+                continue
+        except Exception:
+            continue
+
+        side  = t["side"]
+        entry = t["entry"]
+        sl    = t["sl"]
+        tp1   = t["tp1"]
+        tp2   = t["tp2"]
+        label = t["label"]
+
+        hit_tp2 = (side == "LONG"  and price >= tp2) or (side == "SHORT" and price <= tp2)
+        hit_tp1 = (side == "LONG"  and price >= tp1) or (side == "SHORT" and price <= tp1)
+        hit_sl  = (side == "LONG"  and price <= sl)  or (side == "SHORT" and price >= sl)
+
+        dir_em = "(En haut)" if side == "LONG" else "(En bas)"
+
+        if hit_tp2:
+            gain = abs(tp2 - entry)
+            msg = (
+                f"✅✅ <b>TP2 ATTEINT — {label} {dir_em}</b>\n\n"
+                f"Entree : <b>{fp(entry)}</b>\n"
+                f"TP2    : <b>{fp(tp2)}</b>  ✅\n"
+                f"Gain   : <b>+{fp(gain)}</b>\n\n"
+                f"<i>Execution parfaite. On avance ensemble.</i>\n\n"
+                f"<b>{ADMIN_BOT}</b>"
+            )
+            tg_text(GROUP_PUBLIC, msg); tg_text(GROUP_VIP, msg)
+            gain_est = abs(tp2 - entry) * 10000 * 2.5
+            daily_wins.append({"pair": label, "direction": side, "gain": round(gain_est, 2)})
+            closed.append(tid)
+            print(f"[TRADE #{tid}] TP2 atteint — {label} {side}")
+
+        elif hit_tp1 and not t["tp1_hit"]:
+            open_trades[tid]["tp1_hit"] = True
+            gain = abs(tp1 - entry)
+            msg = (
+                f"✅ <b>TP1 ATTEINT — {label} {dir_em}</b>\n\n"
+                f"Entree : <b>{fp(entry)}</b>\n"
+                f"TP1    : <b>{fp(tp1)}</b>  ✅\n"
+                f"Gain   : <b>+{fp(gain)}</b>\n\n"
+                f"<i>Deplace ton SL au niveau de l'entree (Break Even).\n"
+                f"Laisse courir vers TP2.</i>\n\n"
+                f"<b>{ADMIN_BOT}</b>"
+            )
+            tg_text(GROUP_PUBLIC, msg); tg_text(GROUP_VIP, msg)
+            print(f"[TRADE #{tid}] TP1 atteint — {label} {side} — SL -> BE")
+
+        elif hit_sl:
+            if t["tp1_hit"]:
+                msg = (
+                    f"🔒 <b>TRADE FERME AU BE — {label} {dir_em}</b>\n\n"
+                    f"TP1 avait ete touche — SL ramene a l'entree.\n"
+                    f"<i>Capital protege. Discipline respectee.</i>\n\n"
+                    f"<b>{ADMIN_BOT}</b>"
+                )
+            else:
+                loss = abs(sl - entry)
+                msg = (
+                    f"🔴 <b>STOP LOSS TOUCHE — {label} {dir_em}</b>\n\n"
+                    f"Entree : <b>{fp(entry)}</b>\n"
+                    f"SL     : <b>{fp(sl)}</b>  🔴\n"
+                    f"Perte  : <b>-{fp(loss)}</b>\n\n"
+                    f"<i>C'est le trading. On reste discipline, on passe au suivant.\n"
+                    f"Risk 1% respecte — capital intact.</i>\n\n"
+                    f"<b>{ADMIN_BOT}</b>"
+                )
+            tg_text(GROUP_PUBLIC, msg); tg_text(GROUP_VIP, msg)
+            closed.append(tid)
+            print(f"[TRADE #{tid}] SL touche — {label} {side}")
+
+    for tid in closed:
+        open_trades.pop(tid, None)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ANNONCE 'LA SÉANCE COMMENCE DANS 30 MIN'
+# ══════════════════════════════════════════════════════════════
+
+def post_session_incoming(session_name):
+    """Annonce qu'une session commence dans 30 min — style UCHE exact."""
+    intros = [
+        "La session du matin va commencer",
+        "La session va commencer dans quelques instants",
+        "Les premiers signaux arrivent bientot",
+    ]
+    msg = (
+        f"🟢 <b>ÉQUIPE VIP — EN POSITION</b> 🟢\n\n"
+        f"{random.choice(intros)} 📊\n\n"
+        f"Dans 30 minutes, les premiers signaux arrivent — "
+        f"reste concentre et pret.\n\n"
+        f"Pas de distractions. Pas de retard.\n"
+        f"C'est pour ceux qui passent a l'action.\n\n"
+        f"On travaille ⚡\n"
+        f"<b>{ADMIN_BOT}</b>"
+    )
+    tg_text(GROUP_PUBLIC, msg)
+    tg_text(GROUP_VIP,    msg)
+    print(f"[SESSION] Annonce '{session_name} dans 30 min' envoyee")
+
+
+# ══════════════════════════════════════════════════════════════
+#  BOT TELEGRAM — COMMANDES /start /signal /vip /stats
+# ══════════════════════════════════════════════════════════════
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    name = message.from_user.first_name or "Trader"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 Signal en cours", callback_data="signal"),
+        types.InlineKeyboardButton("👑 Accès VIP",       callback_data="vip"),
+        types.InlineKeyboardButton("📈 Statistiques",    callback_data="stats"),
+        types.InlineKeyboardButton("🔗 Ouvrir XM",       url=XM_LINK),
+    )
+    bot.send_message(
+        message.chat.id,
+        f"👋 Bienvenue <b>{name}</b> sur <b>{CANAL_NAME}</b> !\n\n"
+        f"Je suis le bot officiel de <b>{ADMIN_USERNAME}</b>.\n\n"
+        f"<i>Signaux ICT M1 — Sessions London & New York\n"
+        f"R:R minimum 1:{MIN_RR} — Risk 1% max</i>\n\n"
+        f"Choisis une option ci-dessous :",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=["signal"])
+def cmd_signal(message):
+    sess = get_session()
+    nb   = len(open_trades)
+    h    = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    if not sess:
+        txt = (
+            f"😴 <b>Hors session</b> ({h})\n\n"
+            f"Le bot scanne uniquement pendant les sessions actives :\n"
+            f"• London : 07h–16h UTC\n"
+            f"• New York : 12h–21h UTC\n\n"
+            f"Reviens pendant ces horaires pour les signaux."
+        )
+    elif nb > 0:
+        lines = ""
+        for tid, t in open_trades.items():
+            d = "En haut" if t["side"] == "LONG" else "En bas"
+            be = " (BE)" if t.get("tp1_hit") else ""
+            lines += f"  • <b>{t['label']}</b> {d} — entrée {fp(t['entry'])}{be}\n"
+        txt = (
+            f"📊 <b>{nb} trade(s) ouvert(s)</b> — {h}\n\n"
+            f"{lines}\n"
+            f"Session : <b>{sess.upper()}</b>\n"
+            f"Score min : {MIN_SCORE}%  |  R:R min 1:{MIN_RR}"
+        )
+    else:
+        txt = (
+            f"🔍 <b>Aucun trade ouvert</b> pour l'instant ({h})\n\n"
+            f"Session active : <b>{sess.upper()}</b>\n"
+            f"Le bot scanne toutes les {SCAN_EVERY}s.\n\n"
+            f"<i>Reste pret — le prochain setup arrive.</i>"
+        )
+    bot.send_message(message.chat.id, txt, parse_mode="HTML",
+                     disable_web_page_preview=True)
+
+@bot.message_handler(commands=["vip"])
+def cmd_vip(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✉️ Contacter l'admin", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}"))
+    markup.add(types.InlineKeyboardButton("🔗 Ouvrir compte XM",  url=XM_LINK))
+    markup.add(types.InlineKeyboardButton("₿ Ouvrir Binance",     url=BINANCE_LINK))
+    bot.send_message(
+        message.chat.id,
+        f"👑 <b>ACCÈS VIP — {CANAL_NAME}</b>\n\n"
+        f"<i>Ce que tu obtiens :</i>\n"
+        f"✅ Signaux ICT M1 complets (SL, TP1, TP2)\n"
+        f"✅ Alertes TP atteint / SL touche en temps reel\n"
+        f"✅ R:R minimum 1:{MIN_RR}\n"
+        f"✅ Accompagnement personnalise\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💰 Mensuel     : <b>{VIP_MENSUEL} USDT</b>\n"
+        f"💰 Trimestriel : <b>{VIP_TRIMESTRIEL} USDT</b>\n"
+        f"💰 Annuel      : <b>{VIP_ANNUEL} USDT</b>\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"Contacte <b>{ADMIN_USERNAME}</b> pour rejoindre :",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    nb_wins  = len(daily_wins)
+    total    = sum(w["gain"] for w in daily_wins)
+    nb_open  = len(open_trades)
+    h        = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    sess     = get_session() or "hors session"
+    bot.send_message(
+        message.chat.id,
+        f"📈 <b>STATISTIQUES DU JOUR</b> — {h}\n\n"
+        f"Session active  : <b>{sess.upper()}</b>\n"
+        f"Trades gagnants : <b>{nb_wins}</b>\n"
+        f"Profit total    : <b>+{total:.2f} $</b>\n"
+        f"Trades ouverts  : <b>{nb_open}</b>\n\n"
+        f"Signaux/heure   : {_signals_this_hour}/{MAX_SIGNALS_HOUR}\n"
+        f"Messages/heure  : {_messages_this_hour}/{MAX_MESSAGES_HOUR}\n\n"
+        f"<i>Not financial advice — Risk 1% max</i>",
+        parse_mode="HTML"
+    )
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    if call.data == "signal":
+        cmd_signal(call.message)
+    elif call.data == "vip":
+        cmd_vip(call.message)
+    elif call.data == "stats":
+        cmd_stats(call.message)
+    bot.answer_callback_query(call.id)
+
+def run_bot_polling():
+    """Lance le polling telebot dans un thread separe."""
+    print("[BOT] Demarrage polling commandes...")
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
+
+
+
 
 def scan_once():
     sess=get_session(); now=time.time()
@@ -559,7 +986,7 @@ def scan_once():
         print(f"  {label}: SETUP {result['side']} | RR 1:{result['rr']} | Score {result['score']}%")
         # Garde le meilleur score de ce cycle
         if best is None or result["score"] > best["score"]:
-            best = {**result, "label": label, "session": sess}
+            best = {**result, "label": label, "session": sess, "symbol": symbol}
             cooldowns[symbol] = time.time()
 
     # Envoie uniquement le MEILLEUR setup du cycle
@@ -567,13 +994,21 @@ def scan_once():
         print(f"  >>> MEILLEUR SETUP: {best['label']} {best['side']} Score {best['score']}%")
         send_signal(label=best["label"],side=best["side"],entry=best["entry"],
                     sl=best["sl"],tp1=best["tp1"],tp2=best["tp2"],
-                    rr=best["rr"],score=best["score"],session=best["session"])
+                    rr=best["rr"],score=best["score"],session=best["session"],
+                    symbol=best.get("symbol"))
 
 # ══════════════════════════════════════════════════════════════
 #  SCHEDULER
 # ══════════════════════════════════════════════════════════════
 
 def setup_schedule():
+    # ── Annonces session (30 min avant) ───────────────────────
+    schedule.every().day.at("06:30").do(post_session_incoming, "London")
+    schedule.every().day.at("11:30").do(post_session_incoming, "New York")
+
+    # ── Moniteur trades : toutes les 2 min ────────────────────
+    schedule.every(2).minutes.do(check_open_trades)
+
     # Motivation soir (20h et 22h UTC)
     schedule.every().day.at("20:00").do(post_motivation_soir)
     schedule.every().day.at("22:00").do(post_motivation_soir)
@@ -653,11 +1088,13 @@ if __name__ == "__main__":
     print(f"  RR min : 1:{MIN_RR}  |  Score min : {MIN_SCORE}%")
     print(f"  Max : {MAX_SIGNALS_HOUR} signal/heure  |  {MAX_MESSAGES_HOUR} messages/heure")
     print(f"  Sessions : London 07h-16h + NY 12h-21h UTC")
+    print(f"  Commandes : /start /signal /vip /stats")
     print("="*54)
     setup_schedule()
-    threading.Thread(target=run_schedule, daemon=True).start()
-    threading.Thread(target=keep_alive,   daemon=True).start()
-    threading.Thread(target=run_flask,    daemon=True).start()
+    threading.Thread(target=run_schedule,     daemon=True).start()
+    threading.Thread(target=keep_alive,       daemon=True).start()
+    threading.Thread(target=run_flask,        daemon=True).start()
+    threading.Thread(target=run_bot_polling,  daemon=True).start()
     scan_once()
     while True:
         time.sleep(SCAN_EVERY)
