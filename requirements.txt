@@ -1,9 +1,4 @@
-requests==2.31.0
-yfinance==0.2.36
-pyTelegramBotAPI==4.18.0
-schedule==1.2.1
-Pillow==10.3.0
-flask==3.0.3
+
 requests==2.31.0
 yfinance==0.2.37
 pyTelegramBotAPI==4.21.0
