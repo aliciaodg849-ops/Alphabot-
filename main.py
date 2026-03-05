@@ -1236,3 +1236,4 @@ if __name__ == "__main__":
             publish_challenge()
     else:
         print("MODE inconnu. Valeurs: demo, live, test, reset")
+iiiii
