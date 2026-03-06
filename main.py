@@ -15,6 +15,7 @@
 # ║  pip install requests                                                    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 import os, sys, time, json, math, random, logging, threading, hashlib
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
@@ -135,7 +136,7 @@ FG_TTL          = 3600   # refresh toutes les heures
 # (FEE_TAKER×2) + SIM_SLIPPAGE + SIM_SPREAD + éventuel funding
 # = 0.04%×2 + 0.03% + 0.02% = ~0.13% du notional
 SCAN_INTERVAL   = 20
-TOP_N           = 60
+TOP_N           = 100
 ORDER_WATCH_SEC = 8         # intervalle watchdog ordres
 
 # ── Limites de sécurité du compte ──────────────────────────────────────
@@ -160,7 +161,10 @@ AM_MAX          = 4      # max 4 cycles de boost
 AM_MULT         = 1.50   # compat legacy
 
 # ── Trailing Stop Loss (SL suiveur) ───────────────────────────────────
-TRAIL_ACTIVATE_RR   = 1.0    # active le trail à RR 1:1
+TRAIL_ACTIVATE_RR   = 0.8    # trail actif à RR 0.8 — sécurise tôt
+BE_ACTIVATE_RR      = 0.65   # breakeven à RR 0.65 — jamais perdre si proche du TP
+PARTIAL_CLOSE_RR    = 1.0    # fermeture partielle 50% à RR 1:1 (sécurise gains)
+MIN_PROFIT_CLOSE    = True   # fermer à petit gain si on peut éviter le SL
 TRAIL_ATR_MULT      = 0.6    # trail = 0.6 × ATR sous/sur le prix
 TRAIL_ATR_TIGHT     = 0.35   # après TP1 : trail plus serré
 TRAIL_MIN_STEP_PCT  = 0.002  # ne monte le SL que si gain > 0.2%
@@ -678,8 +682,30 @@ class ChallengeManager:
         fg_mult = fg_risk_mult()
         risk *= fg_mult
 
-        # Cap dur : jamais plus de 25% du solde
-        risk = min(risk, balance * 0.25)
+        # Ajustement série perdante : réduire progressivement
+        loss_streak = STATE.challenge.get("loss_streak_today", 0)
+        if loss_streak >= 3:
+            risk *= 0.60   # -40% après 3 pertes consécutives
+            log.debug(f"[RISK] Série perdante {loss_streak} → risque réduit ×0.6")
+        elif loss_streak >= 2:
+            risk *= 0.80   # -20% après 2 pertes
+
+        # Ajustement série gagnante : augmenter progressivement (max ×1.5)
+        win_streak = STATE.am.get("win_streak", 0)
+        if win_streak >= 4:
+            risk *= min(1.0 + win_streak * 0.08, 1.50)
+            log.debug(f"[RISK] Série gagnante {win_streak} → risque ×{min(1+win_streak*0.08,1.5):.2f}")
+
+        # Marge Binance : vérifier que la marge dispo est suffisante
+        # Ne jamais utiliser plus de 80% de la marge disponible
+        open_margin = sum(t.get("notional",0)/t.get("leverage",1)
+                         for t in STATE.open_trades.values() if t["status"]=="open")
+        max_risk_by_margin = max((balance * 0.80 - open_margin) * 0.15, 0.10)
+        risk = min(risk, max_risk_by_margin)
+
+        # Cap dur : jamais plus de 20% du solde par trade
+        risk = min(risk, balance * 0.20)
+        risk = max(risk, 0.10)  # minimum absolu
 
         return round(risk, 2)
 
@@ -826,10 +852,19 @@ def calc_lot(symbol, risk_usdt, sl_dist, entry, leverage) -> dict:
     # Marge isolée nécessaire = notionnel / levier
     margin_needed = notional / leverage if leverage > 0 else notional
     real_risk = qty * sl_dist + fee_total
+
+    # ── Vérification finale : lot valide pour Binance ────────────────
+    # 1. Quantité doit être multiple du stepSize
+    # 2. Notionnel doit être ≥ minNotional (en LIVE)
+    # 3. Marge ne doit pas dépasser le solde
+    valid = (qty >= min_qty and qty == round_step(qty, step))
+
     return {"qty": qty, "notional": round(notional,4),
             "fee_open": round(fee_open,6), "fee_close": round(fee_close,6),
             "fee_total": round(fee_total,6), "real_risk": round(real_risk,4),
-            "margin_needed": round(margin_needed, 4)}
+            "margin_needed": round(margin_needed, 4),
+            "valid": valid,
+            "min_qty": min_qty, "step": step}
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -965,8 +1000,12 @@ class BotState:
         c = self.challenge
         c["current_balance"] = round(c["current_balance"]+pnl, 4)
         c["today_pnl"]       = round(c.get("today_pnl",0)+pnl, 4)
-        if pnl > 0: c["today_wins"]   = c.get("today_wins",0)+1
-        else:        c["today_losses"] = c.get("today_losses",0)+1
+        if pnl > 0:
+            c["today_wins"]        = c.get("today_wins",0)+1
+            c["loss_streak_today"] = 0   # reset série perdante
+        else:
+            c["loss_streak_today"] = c.get("loss_streak_today",0)+1
+            c["today_losses"]      = c.get("today_losses",0)+1
         c["best_rr"]      = max(c.get("best_rr",0), float(rr))
         c["all_time_peak"] = max(c.get("all_time_peak",c["start_balance"]),
                                  c["current_balance"])
@@ -2279,7 +2318,13 @@ def agent_scan(balance, mgr) -> list:
     all_s = []
     for sym in STATE.top_pairs[:TOP_N]:
         all_s.extend(scan_symbol(sym, bias, balance, mgr))
-    all_s.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
+    # Tri final : score ICT + alignement BTC + RR
+    for s in all_s:
+        bf = btc_filter(s["symbol"], s["side"], s["score"])
+        btc_bonus = bf.get("delta", 0)
+        # Score composite = score ICT + bonus BTC (max +15 si aligné, -20 si contre)
+        s["final_score"] = s["score"] + btc_bonus
+    all_s.sort(key=lambda x: (x["final_score"], x["rr"]), reverse=True)
     return all_s
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2605,25 +2650,34 @@ def check_trades(mgr):
                 report_trail(t, new_trail, rr_c)
                 sl = new_trail
 
-        # ── BE classique (fallback si pas encore trail) ──────────────
-        elif rr_c >= 1.0 and not t.get("be_active"):
-            be = entry * 1.0002 if side == "BUY" else entry * 0.9998
+        # ── BE anticipé : à RR 0.65 → SL à entrée + frais ──────────
+        # Philosophie : mieux vaut 0$ que -0.50$
+        if rr_c >= BE_ACTIVATE_RR and not t.get("be_active"):
+            fee_pct = (FEE_TAKER * 2 + SIM_SLIPPAGE + SIM_SPREAD)
+            # BE = entrée + frais (on ressort avec ~0$, pas de perte)
+            be = entry * (1 + fee_pct) if side == "BUY" else entry * (1 - fee_pct)
             if LIVE_ORDERS:
                 _update_sl_on_exchange(t, be)
             else:
                 with STATE._lock: t["sl"] = be; t["trail_sl"] = be; t["be_active"] = True
             t["be_active"] = True
             report_be(t, be, rr_c)
+            log.debug(f"[BE] #{t['id']} BE anticipé à RR{rr_c:.2f} — SL={be:.6f} (frais couverts)")
 
-        # ── TP1 ──────────────────────────────────────────────────────
+        # ── TP1 : fermeture 50% + SL à TP1 (profit garanti sur reste) ──
         hit_tp1 = (price >= tp1 if side == "BUY" else price <= tp1)
         if hit_tp1 and not t.get("tp1_hit"):
             with STATE._lock:
                 t["tp1_hit"] = True
-                t["sl"]      = tp1
+                t["sl"]      = tp1   # SL déplacé à TP1 = profit garanti
                 t["trail_sl"]= tp1
+                # Enregistrer gain partiel (50% de la position)
+                pnl_partial = round(t["risk_usdt"] * (abs(tp1-entry)/abs(entry-t["sl0"])) * 0.5
+                                    - t["fee_total"] * 0.5, 4)
+                t["pnl_tp1_partial"] = pnl_partial
             report_tp1(t, price, mgr)
             sl = tp1
+            log.debug(f"[TP1] #{t['id']} 50% fermé +{pnl_partial:.4f}$ — reste court vers TP2")
 
         # ── Surveillance SL rejetés (démo + live) ────────────────────
         tid_str = str(t["id"])
@@ -2861,6 +2915,20 @@ def _print_pos(mgr):
               f"RR:{rrc:.2f}  Qty:{t.get('qty')}  Reg:{t.get('regime','?')}")
         print(f"     SL:{sl_display:.5f}  TP1:{t['tp1']:.5f}  TP2:{t['tp2']:.5f}{rsl_str}")
 
+def _ping_server():
+    """Serveur HTTP minimal pour satisfaire Render healthcheck sur /ping."""
+    class PingHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            bal = STATE.challenge.get("current_balance", 0)
+            trades = sum(1 for t in STATE.open_trades.values() if t["status"]=="open")
+            self.wfile.write(f"OK bal={bal:.2f} trades={trades}".encode())
+        def log_message(self, *a): pass  # silence les logs HTTP
+    port = int(os.environ.get("PORT", 10000))
+    srv = HTTPServer(("0.0.0.0", port), PingHandler)
+    srv.serve_forever()
+
 def run():
     mgr = ChallengeManager(STATE)
     STATE.challenge_mgr = mgr
@@ -2926,6 +2994,11 @@ def run():
             )
         except: pass
     threading.Thread(target=_dm_start, daemon=True).start()
+
+    # ── Ping server pour Render healthcheck ──────────────────────────
+    ping_thread = threading.Thread(target=_ping_server, daemon=True)
+    ping_thread.start()
+    log.debug(f"[PING] Serveur HTTP démarré port {os.environ.get('PORT',10000)}")
 
     # ── Démarrer le poller Telegram ───────────────────────────────────
     tg_thread = threading.Thread(target=_tg_poller, daemon=True)
