@@ -290,7 +290,7 @@ CACHE_TTL = 55  # secondes
 
 # Prix spot attendus pour sanity-check
 _PRICE_RANGES = {
-    "GC=F":    (1800, 3500),   # Gold futures $/oz
+    "GC=F":    (1800, 4000),   # Gold futures $/oz (élargi pour 2025-2026)
     "SI=F":    (15, 40),       # Silver futures $/oz
     "NQ=F":    (15000, 25000), # NASDAQ futures
     "ES=F":    (3000, 6500),   # S&P futures
@@ -304,25 +304,46 @@ _PRICE_RANGES = {
 }
 
 def _yf_price(ticker: str) -> Optional[float]:
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
-        r   = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
-        p   = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    lo, hi = _PRICE_RANGES.get(ticker, (0, 999999))
 
-        # Sanity check — Gold/Silver parfois retourné en cents par Yahoo
-        if ticker == "GC=F" and p > 4000:
-            p = p / 100   # convertir cents → dollars
-        if ticker == "SI=F" and p > 100:
-            p = p / 100
+    # Essayer plusieurs endpoints Yahoo
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
 
-        # Vérification plage réaliste
-        lo, hi = _PRICE_RANGES.get(ticker, (0, 999999))
-        if lo > 0 and not (lo <= p <= hi):
-            log.warning(f"[PRICE] {ticker} prix suspect: {p} (attendu {lo}-{hi})")
-            return None
-        return p
-    except Exception:
-        return None
+            # Essayer regularMarketPrice puis previousClose
+            for field in ("regularMarketPrice", "chartPreviousClose", "previousClose"):
+                raw = meta.get(field)
+                if raw is None:
+                    continue
+                p = float(raw)
+
+                # Corrections auto selon plage attendue
+                if lo > 0:
+                    # Si p × 50 tombe dans la plage → données en contrats mini
+                    if not (lo <= p <= hi) and lo <= p * 50 <= hi:
+                        p = p * 50
+                    # Si p × 100 dans la plage → cents
+                    elif not (lo <= p <= hi) and lo <= p * 100 <= hi:
+                        p = p * 100
+                    # GC=F spécifique : parfois divisé par 100
+                    elif ticker == "GC=F" and p > 4000:
+                        p = p / 100
+
+                if lo > 0 and not (lo <= p <= hi):
+                    continue  # Essayer le champ suivant
+                return round(p, 5)
+        except Exception:
+            continue
+
+    log.warning(f"[PRICE] {ticker} — impossible d'obtenir un prix valide")
+    return None
 
 def _bnb_price(sym: str) -> Optional[float]:
     try:
@@ -2493,7 +2514,29 @@ def run_test():
 #  ENTRY POINT — Compatible PyDroid 3 + PC + Render
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Instance unique — évite le 409 Conflit Telegram ─────────────────────────
+import os, atexit
+
+_LOCK_FILE = "/tmp/alphabot_v14.lock"
+
+def _acquire_lock():
+    if os.path.exists(_LOCK_FILE):
+        try:
+            pid = int(open(_LOCK_FILE).read().strip())
+            # Vérifier si le process tourne encore
+            os.kill(pid, 0)
+            print(f"❌ AlphaBot déjà en cours (PID {pid}). Arrête l'autre instance d'abord.")
+            print(f"   Sur VPS : kill {pid}")
+            print(f"   Sur PyDroid : arrêter le script actif")
+            raise SystemExit(1)
+        except (ProcessLookupError, ValueError):
+            pass  # Process mort → on peut continuer
+    with open(_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(_LOCK_FILE) and os.remove(_LOCK_FILE))
+
 if __name__ == "__main__":
+    _acquire_lock()
 
     # ── PyDroid 3 : change ce paramètre puis appuie sur ▶ ──────────────────
     PYDROID_MODE = "live"   # "test" | "live" | "reset"
