@@ -1066,15 +1066,21 @@ def risk_usdt(balance: float, score: int, am_cycle: int) -> float:
     raw = balance * pct * (AM_MULT ** am_cycle)
     return round(min(raw, balance * 0.20), 4)
 
-def position_size(symbol: str, risk: float, sl_dist: float, price: float) -> Dict:
+def position_size(symbol: str, risk: float, sl_dist: float, price: float, balance: float = 10.0) -> Dict:
     mkt = MARKETS[symbol]
     cat = mkt["cat"]
 
     if cat == "FOREX":
-        sl_pips  = sl_dist / mkt["pip"]
-        lots     = risk / (sl_pips * mkt["pip_val"]) if sl_pips > 0 else 0.01
-        lots     = round(max(0.01, min(lots, 100)), 2)
-        leverage = min(500, max(50, round(price*lots*100_000/max(risk*50,1))))
+        sl_pips = sl_dist / mkt["pip"] if mkt["pip"] > 0 else 1
+        # pip_val selon type de paire
+        # JPY pairs (price>50) : pip_val = pip/price × 100000 (en USD)
+        # USD base : pip_val fixe (ex: USDCHF ≈ 6.xx$ variable)
+        # En pratique, utiliser pip_val du MARKETS dict (déjà calibré)
+        pip_val_dyn = mkt["pip_val"]
+        lots = risk / (sl_pips * pip_val_dyn) if sl_pips > 0 and pip_val_dyn > 0 else 0.01
+        lots = round(max(0.01, min(lots, 100)), 2)
+        # Levier standard broker (XM = 500x Forex)
+        leverage    = 500
     elif cat in ("GOLD","SILVER"):
         # MODE SCALP : lot fixe 0.01, risque plafonné à SCALP_RISK_USD
         sl_pips  = sl_dist / mkt["pip"]
@@ -1104,8 +1110,17 @@ def position_size(symbol: str, risk: float, sl_dist: float, price: float) -> Dic
     # Marge réelle selon la catégorie
     if leverage > 0:
         if cat == "FOREX":
-            # Forex : lots × 100 000 × price / leverage
-            margin = round(lots * 100_000 * price / leverage, 2)
+            # USD_BASE pairs (USDJPY, USDCHF, USDCAD) : marge en USD sans conversion
+            if symbol in {"USDJPY", "USDCHF", "USDCAD"}:
+                margin = round(lots * 100_000 / leverage, 2)
+            elif symbol.endswith("JPY"):
+                # Cross JPY (GBPJPY, EURJPY) : base ≠ USD
+                # Estimer prix base/USD : GBPJPY/USDJPY ≈ GBPUSD
+                _base_usd = price / 159.0  # approximation cross JPY → USD
+                margin = round(lots * 100_000 * _base_usd / leverage, 2)
+            else:
+                # Non-USD base (EURUSD, GBPUSD, AUDUSD...) : × price
+                margin = round(lots * 100_000 * price / leverage, 2)
         elif cat in ("GOLD", "SILVER"):
             # Gold/Silver : lots × 100 oz × price / leverage
             margin = round(lots * 100 * price / leverage, 2)
@@ -2055,7 +2070,7 @@ def sniper_triple_confirm(symbol: str, balance: float,
                 price_now = get_price(symbol) or best_this.get("entry", 1.0)
                 risk      = risk_usdt(balance, best_this.get("score", 80), S.am["cycle"])
                 sl_dist   = best_this.get("sl_dist", 0.001)
-                pos       = position_size(symbol, risk, sl_dist, price_now)
+                pos       = position_size(symbol, risk, sl_dist, price_now, balance)
                 pos["risk_usdt"] = risk
                 pos["pip_val"]   = MARKETS[symbol].get("pip_val", 1.0)
                 best_this.update({
@@ -2108,6 +2123,159 @@ def sniper_triple_confirm(symbol: str, balance: float,
     return best_result
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROFIL DE SESSION — Adaptation automatique selon l'heure UTC
+# ══════════════════════════════════════════════════════════════════════════════
+
+SESSION_PROFILES = {
+    # Clé: (heure_debut, heure_fin) UTC
+    # Valeurs: scan_interval, min_score, min_prob, cooldown, markets_priority, label
+
+    "INTER_NUIT": {
+        "hours":    (22, 24),  # 22h-00h UTC — Zone morte post NY
+        "scan_s":   90,        # Scan lent (moins de volatilité)
+        "min_score": 85,       # Très sélectif (peu de setups propres)
+        "min_prob":  68,
+        "cooldown":  45,
+        "markets":  ["XAUUSD","USDJPY","GBPJPY"],   # Seuls actifs nocturnes
+        "label":    "🌙 Inter-session (zone calme)",
+        "log_msg":  "Peu de volatilité. Bot en veille légère — cherche Gold/JPY uniquement.",
+    },
+    "INTER_NUIT2": {
+        "hours":    (0, 0),    # minuit exact — géré séparément
+        "scan_s":   90,
+        "min_score": 85,
+        "min_prob":  68,
+        "cooldown":  45,
+        "markets":  ["XAUUSD","USDJPY","GBPJPY"],
+        "label":    "🌙 Inter-session",
+        "log_msg":  "Zone calme. Bot en veille légère.",
+    },
+    "ASIA": {
+        "hours":    (0, 7),    # 00h-07h UTC — Session Asie
+        "scan_s":   60,
+        "min_score": 80,
+        "min_prob":  65,
+        "cooldown":  30,
+        "markets":  ["XAUUSD","USDJPY","GBPJPY","EURJPY","AUDUSD","NZDUSD","XAGUSD"],
+        "label":    "🌏 Session Asie",
+        "log_msg":  "Asie active. Focus JPY, Gold, AUD. Tendances douces.",
+    },
+    "LONDON_OPEN": {
+        "hours":    (7, 10),   # 07h-10h UTC — London Open (volatilité ++++)
+        "scan_s":   30,        # Scan rapide !
+        "min_score": 78,       # Moins strict — beaucoup de setups propres
+        "min_prob":  63,
+        "cooldown":  20,
+        "markets":  ["XAUUSD","EURUSD","GBPUSD","GBPJPY","EURGBP","USDCHF",
+                     "USDJPY","NAS100","GER40","UK100","XAGUSD"],
+        "label":    "🇬🇧 London Open 🔥",
+        "log_msg":  "LONDON OPEN — Volatilité maximale. Meilleure session du jour. Tous marchés actifs.",
+    },
+    "LONDON_MID": {
+        "hours":    (10, 13),  # 10h-13h UTC — London milieu
+        "scan_s":   45,
+        "min_score": 80,
+        "min_prob":  65,
+        "cooldown":  25,
+        "markets":  ["XAUUSD","EURUSD","GBPUSD","GBPJPY","NAS100","GER40","XAGUSD"],
+        "label":    "🇬🇧 London Mid-session",
+        "log_msg":  "London continue. Tendances établies — cherche les continuations.",
+    },
+    "NY_OPEN": {
+        "hours":    (13, 17),  # 13h-17h UTC — NY Open + Overlap (MEILLEURE HEURE)
+        "scan_s":   30,        # Scan très rapide
+        "min_score": 76,       # Le plus permissif — meilleure heure
+        "min_prob":  62,
+        "cooldown":  18,
+        "markets":  ["XAUUSD","EURUSD","GBPUSD","NAS100","US500","US30",
+                     "GBPJPY","USDCHF","USDCAD","XAGUSD","GER40","BTCUSD"],
+        "label":    "🇺🇸 NY Open + Overlap 🔥🔥",
+        "log_msg":  "NY OPEN + OVERLAP — Session la plus volatile. Maximum d'opportunités. Tous marchés.",
+    },
+    "NY_MID": {
+        "hours":    (17, 20),  # 17h-20h UTC — NY milieu
+        "scan_s":   45,
+        "min_score": 80,
+        "min_prob":  65,
+        "cooldown":  25,
+        "markets":  ["XAUUSD","EURUSD","GBPUSD","NAS100","US500","USDCAD","USDCHF"],
+        "label":    "🇺🇸 NY Mid-session",
+        "log_msg":  "NY milieu. Tendances NY établies. Focus USD pairs et indices.",
+    },
+    "NY_CLOSE": {
+        "hours":    (20, 22),  # 20h-22h UTC — NY Close
+        "scan_s":   40,
+        "min_score": 80,
+        "min_prob":  65,
+        "cooldown":  25,
+        "markets":  ["XAUUSD","EURUSD","GBPUSD","NAS100","US500","US30","USDCHF"],
+        "label":    "🇺🇸 NY Close KZ",
+        "log_msg":  "NY Close. Dernières opportunités de la session US. Attention aux retournements.",
+    },
+}
+
+
+def get_session_profile() -> Dict:
+    """
+    Retourne le profil actif selon l'heure UTC actuelle.
+    Adapte automatiquement : scan_interval, min_score, min_prob,
+    cooldown et liste des marchés prioritaires.
+    """
+    h = datetime.now(timezone.utc).hour
+
+    for key, profile in SESSION_PROFILES.items():
+        start, end = profile["hours"]
+        if start == end:
+            continue
+        # Gérer le cas 22-24 (pas de minuit dans range)
+        if start > end:
+            if h >= start or h < end:
+                return profile
+        else:
+            if start <= h < end:
+                return profile
+
+    # Fallback : inter-session
+    return SESSION_PROFILES["INTER_NUIT"]
+
+
+def apply_session_profile(profile: Dict) -> None:
+    """
+    Applique dynamiquement le profil de session aux variables globales.
+    Appelé au début de chaque cycle de scan.
+    """
+    global MIN_SCORE, MIN_TP_PROB, COOLDOWN_MIN, SCAN_INTERVAL
+    MIN_SCORE    = profile["min_score"]
+    MIN_TP_PROB  = profile["min_prob"]
+    COOLDOWN_MIN = profile["cooldown"]
+    SCAN_INTERVAL = profile["scan_s"]
+
+
+_last_session_label = ""   # pour logger uniquement au changement de session
+
+
+def log_session_change(profile: Dict) -> None:
+    """Log + DM quand la session change."""
+    global _last_session_label
+    label = profile["label"]
+    if label != _last_session_label:
+        _last_session_label = label
+        msg = (
+            f"⏰ <b>NOUVELLE SESSION</b>\n"
+            f"{label}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Score min : {profile['min_score']}  |  Prob min : {profile['min_prob']}%\n"
+            f"⏱ Scan : toutes les {profile['scan_s']}s  |  Cooldown : {profile['cooldown']}min\n"
+            f"🎯 Marchés prioritaires : {', '.join(profile['markets'][:6])}{'...' if len(profile['markets'])>6 else ''}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💬 {profile['log_msg']}"
+        )
+        log.info(f"[SESSION] {label} — {profile['log_msg']}")
+        dm(msg)
+
+
+
 def main_loop():
     log.info("═"*70)
     log.info("  ALPHABOT PRO v7 — Agent IA Live")
@@ -2150,13 +2318,18 @@ def main_loop():
             time.sleep(SCAN_INTERVAL)
             continue
 
+        # ── ADAPTATION SESSION AUTOMATIQUE ───────────────────────
+        _prof = get_session_profile()
+        apply_session_profile(_prof)
+        log_session_change(_prof)
+
         # ── SCAN COMPLET ──────────────────────────────────────────
         kz    = get_kill_zone()
-        sess  = session_label()
+        sess  = _prof["label"]
         log.info(
             f"[SCAN #{scan_n}] {sess}"
             f"{' 🎯 '+kz if kz else ''} | "
-            f"Solde:{balance:.2f}$ | AM:{S.am['cycle']}/4 | "
+            f"Solde:{balance:.2f}$ | Score≥{MIN_SCORE} Prob≥{MIN_TP_PROB}% | "
             f"Open:{open_ct}/{MAX_OPEN_TRADES}"
         )
 
@@ -2164,16 +2337,9 @@ def main_loop():
         # Étape 1 : scan rapide pour identifier les candidats
         # Ordre de scan : volatils en premier MAIS tous les marchés
         # sont éligibles — le bot choisit le MEILLEUR setup peu importe le marché
-        VOLATILE_FIRST = [
-            "XAUUSD","XAGUSD","NAS100",              # Scalp rapide
-            "GBPJPY","EURJPY","GBPUSD","EURUSD",     # Forex haute liquidité
-            "BTCUSD","US500","GER40","US30",          # Indices + Crypto
-            "USDCHF","USDCAD","AUDUSD","NZDUSD",     # Forex majeurs
-            "EURGBP","EURCAD","GBPCAD",              # Forex croisés
-            "UK100","FRA40","JPN225","AUS200",        # Indices secondaires
-            "XAGUSD",                                # Silver
-        ]
-        SCAN_ORDER = VOLATILE_FIRST + [s for s in MARKETS if s not in VOLATILE_FIRST]
+        # Marchés prioritaires selon la session active
+        _session_mkts = _prof["markets"]
+        SCAN_ORDER    = _session_mkts + [s for s in MARKETS if s not in _session_mkts]
         candidates: List[Dict] = []
         for symbol in SCAN_ORDER:
             if symbol not in MARKETS: continue
@@ -3363,6 +3529,9 @@ def run_trade_followup():
 
         except Exception as e:
             log.warning(f"[FOLLOWUP #{tid}] Erreur: {e}")
+
+
+
 
 
 def main_loop_v2():
